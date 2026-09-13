@@ -43,7 +43,7 @@ Run from the checkout with `/Users/ndn/development/let-go/lg` (tested dev bdd826
 Final default suite: **609 tests / 5,679 assertions / zero failures**, exit 0.
 The fresh main sentinel baseline was 604 tests / 5,502 assertions / zero failures.
 The reusable bounded HTTP wrapper independently passed all 8 cases in 2,208 ms;
-its checker exited 0 without timing out. See `session-error-contract-evidence.edn`.
+its checker exited 0 without timing out. See `evidence/session-error-contract-evidence.edn`.
 
 ## Execution boundary and residuals
 

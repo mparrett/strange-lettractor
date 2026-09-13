@@ -4,11 +4,14 @@
    provider, e.g. llamacpp/qwen3.8-27b). Each row is a natural-language task
    given to a real session in a fresh temporary directory; the row passes on
    the observable outcome (files on disk, tool results, events), never on the
-   model's wording. Records go to docs/parity-matrix-evidence/<model>.edn. Exit 0 when
+   model's wording. Records go to evidence/parity-matrix-evidence/<model>-<time>.edn. Exit 0 when
    every row passed, 1 otherwise, 3 when no model is configured."
   (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io]
             [attractor.agent :as agent] [attractor.execution :as execution]
-            [attractor.llm :as llm] [attractor.providers :as providers]))
+            [attractor.llm :as llm] [attractor.providers :as providers]
+            [attractor.profiles :as profiles]
+            [live.parity-matrix-checks :as checks]
+            [live.provider-matrix-checks :as selection]))
 
 (defn- env [k] (let [v (os/getenv k)] (when-not (str/blank? v) v)))
 
@@ -19,11 +22,12 @@
     root))
 
 (defn- session [spec dir events]
-  (let [[provider _] (let [i (str/index-of spec "/")] [(subs spec 0 i) (subs spec (inc i))])
+  (let [[provider model] (let [i (str/index-of spec "/")] [(subs spec 0 i) (subs spec (inc i))])
         client (llm/make-client {:default_provider provider
                                  :providers {provider (llm/make-provider-adapter provider {})}})]
     (agent/make-session
       {:model spec :llm_client client
+       :provider_profile (checks/profile-for (providers/protocol-of provider) provider model)
        :execution_env (execution/make-local-environment {:working_dir dir :default_command_timeout_ms 10000})
        :project_docs [] :max_subagent_depth 0 :max_tool_rounds_per_input 12
        :retry_policy {:max_retries 1}
@@ -76,7 +80,20 @@
                    full (some #(when (> (count (str (:output %))) 60000) %) (tool-ends events))
                    model-view (some #(when (str/includes? (str (:content %)) "Tool output was truncated") %)
                                     (mapcat :results (filter #(= :tool_results (:type %)) history)))]
-               (and (seq reads) (some? full) (some? model-view))))}])
+               (and (seq reads) (some? full) (some? model-view))))}
+   {:row :error-recovery
+    :setup (fn [dir] (io/spit (str dir "/recovery-source.txt") "recovered-token\n"))
+    :prompt "First call read_file on absent-source.txt. After receiving its error, read recovery-source.txt instead. Write the recovered text into recovered.txt."
+    :check (fn [dir events _ history]
+             (when (= "recovered-token\n" (file dir "recovered.txt"))
+               (checks/recovery-evidence history "recovered-token")))}
+   {:row :provider-edit-format
+    :setup (fn [dir] (io/spit (str dir "/edit-target.txt") "before\nkeep this line\n"))
+    :prompt "Read edit-target.txt and use your profile's dedicated editing tool (apply_patch if available, otherwise edit_file) to change only before to after. Preserve the remaining text exactly. Do not use shell or write_file."
+    :check (fn [dir events _ history]
+             (and (= "after\nkeep this line\n" (file dir "edit-target.txt"))
+                  (used? events "read_file")
+                  (not (used? events "shell")) (not (used? events "write_file"))))}])
 
 (defn- run-row [spec {:keys [row prompt setup check]}]
   (let [dir (fresh-dir) events (atom []) started (System/currentTimeMillis)]
@@ -87,11 +104,28 @@
                        (catch Object e {:error {:category (:category (ex-data e)) :message (ex-message e)}}))
           history (:history @s)
           _ (agent/close-session! s)
-          passed (and (nil? (:error outcome))
-                      (try (boolean (check dir @events (:answer outcome) history)) (catch Object _ false)))]
+          proof (when (nil? (:error outcome))
+                  (try (check dir @events (:answer outcome) history) (catch Object _ false)))
+          profile (:provider_profile @s)
+          expected-edit (if (some #(= "apply_patch" (:name %))
+                                 (profiles/profile-tools profile)) "apply_patch" "edit_file")
+          edit-result (some #(when (and (= expected-edit (:tool_name %)) (false? (:is_error %))) %)
+                            (mapcat :results (filter #(= :tool_results (:type %)) history)))
+          passed (and proof (or (not= row :provider-edit-format) (some? edit-result)))]
       {:row row :status (if passed :pass :fail) :model spec
+       :protocol (providers/protocol-of (:id profile))
+       :proof (cond (map? proof) proof
+                    (and passed (= row :provider-edit-format)) {:editing_tool expected-edit :file_verified true}
+                    :else nil)
        :duration_ms (- (System/currentTimeMillis) started)
        :tools (mapv :tool_name (tool-starts @events))
+       :failure_details (when-not passed
+                          {:answer (:answer outcome)
+                           :tool_calls (vec (mapcat :tool_calls (filter #(= :assistant (:type %)) history)))
+                           :tool_results (mapv #(update % :content (fn [s] (subs (str s) 0 (min 4000 (count (str s))))))
+                                               (mapcat :results (filter #(= :tool_results (:type %)) history)))
+                           :recovered_file (when (= row :error-recovery) (file dir "recovered.txt"))
+                           :edited_file (when (= row :provider-edit-format) (file dir "edit-target.txt"))})
        :error (:error outcome)})))
 
 (defn -main [& _]
@@ -101,12 +135,16 @@
       (let [[provider _] (let [i (str/index-of spec "/")] [(subs spec 0 i) (subs spec (inc i))])]
         (when (nil? (providers/protocol-of provider))
           (prn {:status :error :reason (str "unknown provider " provider)}) (os/exit 2))
-        (let [results (mapv (fn [row] (let [r (run-row spec row)] (prn r) r)) rows)
+        (let [selected (some-> (env "ATTRACTOR_PARITY_ROWS") (str/split #",")
+                              (#(set (map (comp keyword str/trim) %))))
+              selected-rows (mapv second (selection/select-journeys (mapv (juxt :row identity) rows) selected))
+              results (mapv (fn [row] (let [r (run-row spec row)] (prn (providers/redact r)) r)) selected-rows)
               failed (filter #(= :fail (:status %)) results)
               evidence {:scenario "SCN-CAL-PARITY-LIVE" :recorded_at (str (System/currentTimeMillis))
-                        :model spec :rows results}]
-          (io/mkdir "docs/parity-matrix-evidence")
-          (io/spit (str "docs/parity-matrix-evidence/" (str/replace spec #"[^A-Za-z0-9._-]+" "-") ".edn")
+                        :model spec :available_rows (mapv :row rows) :rows results}]
+          (io/mkdir "evidence/parity-matrix-evidence")
+          (io/spit (str "evidence/parity-matrix-evidence/" (str/replace spec #"[^A-Za-z0-9._-]+" "-")
+                        "-" (:recorded_at evidence) ".edn")
                    ;; Evidence never carries a credential, even inside an error message.
                    (pr-str (providers/redact evidence)))
           (prn {:model spec :rows (count results) :passed (- (count results) (count failed)) :failed (count failed)})

@@ -12,7 +12,7 @@ Five tests / 85 assertions pass, including stale cancellation/error, direct
 successors, reverse successor-abort isolation, follow-up cancellation cleanup,
 and adoption of a newly published but unadmitted session. Impacted tests pass
 198/1405; full suite passes 644/5970; standalone bundle and CLI build/help pass.
-See `turn-ownership-evidence.edn`. Broader shutdown conformance remains open.
+See `evidence/turn-ownership-evidence.edn`. Broader shutdown conformance remains open.
 
 ## Historical reproduction
 

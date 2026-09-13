@@ -33,6 +33,10 @@ patched let-go runtime described below.
 
 ## Build and run
 
+Generated test reports and live-run artifacts stay in ignored `evidence/`, outside
+the documentation tree. See [verification output](docs/verification.md) for the
+test commands and retention policy.
+
 Prerequisites:
 
 - [lgx](https://github.com/abogoyavlensky/lgx) 0.1.0-rc2 or newer.

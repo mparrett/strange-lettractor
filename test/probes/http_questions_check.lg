@@ -79,6 +79,7 @@
     (let [port (if (second args) (parse-long (second args)) (+ 30000 (rand-int 20000)))]
       (ensure! (and (= "run" (first args)) (integer? port) (<= 1024 port 65535)) "Expected run and optional nonprivileged port")
       (let [result (run-check port)]
-        (io/spit "docs/http-question-wire-evidence.edn" (pr-str result))
+        (io/mkdir "evidence")
+        (io/spit "evidence/http-question-wire-evidence.edn" (pr-str result))
         (prn result)))))
 (when *command-line-args* (apply -main *command-line-args*))

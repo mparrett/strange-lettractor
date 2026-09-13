@@ -3,7 +3,7 @@
    Opt-in: set ATTRACTOR_LIVE_MODEL to provider/name (for example
    openai-compat/qwen3.8-27b with OPENAI_COMPAT_BASE_URL pointing at llama.cpp). Without it
    the run exits 3 and prints a skip record; a skip is never a pass.
-   Stage artifacts and result.edn persist under docs/runtime-smoke-evidence;
+   Stage artifacts and result.edn persist under evidence/runtime-smoke-evidence;
    only the model's temporary working directory is removed."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
             [os :as os] [io :as io] [json :as json]
@@ -27,7 +27,7 @@
 
 (def model (os/getenv "ATTRACTOR_LIVE_MODEL"))
 (def evidence-root
-  (str "docs/runtime-smoke-evidence/"
+  (str "evidence/runtime-smoke-evidence/"
        (str/replace (or model "unset") #"[^A-Za-z0-9._-]" "-")
        "-" (System/currentTimeMillis)))
 

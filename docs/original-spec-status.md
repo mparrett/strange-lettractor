@@ -2,6 +2,16 @@
 
 This is a reconciliation of existing records, not a fresh completion audit.
 
+Generated reports are local/CI output under ignored `evidence/`, not repository
+deliverables. See [verification output](verification.md). Coding-agent parity
+is also partial: its scripted matrix covers eight of fifteen rows and its live
+runner now covers ten. Historical gateway runs used generic profiles; the runner
+now selects native tools by protocol. See `coding-agent-definition-of-done.md`.
+
+Latest default-runtime suite: 1153 tests, 10330 assertions, zero failures,
+including named schema anchors and embedded resource scope. This predates the
+parity-runner-only changes. The fresh pinned-runtime result below is separate.
+
 Update 2026-09-12: the execution audit found an original-scope cross-feature defect
 despite completed story statuses: manager-started children bypassed transforms
 and validation. It is now fixed with failing-before/passing-after and compiled
@@ -27,7 +37,7 @@ completion claims.
 
 Fresh real-model runtime smoke evidence now passes against the configured local
 llama.cpp provider, with stage artifacts and checkpoint retained under
-`docs/runtime-smoke-evidence/llamacpp-qwen3.8-27b-1789239367502/`. See
+`evidence/runtime-smoke-evidence/llamacpp-qwen3.8-27b-1789239367502/`. See
 `runtime-integration-audit.md`. This closes the fresh runtime-smoke evidence gap,
 not the unified-client provider matrix or release-runtime compatibility work.
 
@@ -59,12 +69,12 @@ Remaining original-scope closure work:
 - Live Gemini parity is still recorded as credential-gated. OpenAI Responses and
   Anthropic Messages have live evidence through OpenRouter protocol-compatible
   endpoints, not direct first-party endpoint proof. See the requirement ledgers
-  and `provider-matrix-evidence.edn`.
+  and `evidence/provider-matrix-evidence.edn`.
 - Reconcile every original definition-of-done checkbox with current implementation
   and authoritative artifacts, then run the final integrated release verification.
   The earlier missing `parity-matrix-evidence.edn` citation finding is stale:
   `coding-agent-definition-of-done.md` now identifies the live runner, and evidence
-  exists under `docs/parity-matrix-evidence/` as per-model EDN files. These include
+  exists under `evidence/parity-matrix-evidence/` as per-model EDN files. These include
   OpenAI Responses and Anthropic Messages protocol runs, plus a Gemini model run
   through OpenRouter; that last file does not establish Gemini native-protocol
   parity. Existing artifacts still require requirement-by-requirement assessment.
@@ -84,4 +94,4 @@ Their unfinished work must not be counted as unimplemented StrongDM requirements
 
 Sources: `docs/upstream/strongdm-attractor/{attractor-spec,coding-agent-loop-spec,
 unified-llm-spec}.md`; `docs/superpowers/iterations/requirements/*.md`;
-`docs/coding-agent-definition-of-done.md`; `docs/provider-matrix-evidence.edn`.
+`docs/coding-agent-definition-of-done.md`; `evidence/provider-matrix-evidence.edn`.

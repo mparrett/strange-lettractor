@@ -27,7 +27,7 @@ Evidence:
 - The native let-go client exercised the compiled server over loopback, without
   model calls: question IDs, stage, answer routing, context keys, question cleanup,
   and timeout/default routing all passed. The owned process settled during
-  cleanup. [`http-question-wire-evidence.edn`](http-question-wire-evidence.edn)
+  cleanup. `evidence/http-question-wire-evidence.edn` (local output: `evidence/http-question-wire-evidence.edn`)
   records the result and temporary server artifact directory.
 
 Reproduce from the repository root after building:

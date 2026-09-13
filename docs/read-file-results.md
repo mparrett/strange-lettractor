@@ -51,7 +51,7 @@ Focused and bundled evidence: 14 tests / 439 assertions. Impacted evidence:
 All four formats have local signature/byte-preservation checks; PNG is the
 representative image in all three agent/provider continuations, with PNG/GIF in
 the Gemini mixed batch. JPEG/WebP do not yet have separate agent/wire fixtures.
-See `read-file-contract-evidence.edn` for the baseline and regression history.
+See `evidence/read-file-contract-evidence.edn` for the baseline and regression history.
 These are local-file, real-agent, native-hook and provider-encoding checks—not
 live model acceptance, vision quality, full provider-reference fidelity, or
 native-Go AOT parity.

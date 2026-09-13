@@ -29,7 +29,7 @@ Smoke (§11.13): `smoke_test.lg` passes 1 test/24 assertions with deterministic
 responses. `test/live/attractor_smoke.lg` uses the real agent backend for the
 plan/implement/review pipeline and checks routing, nonempty responses, stage
 status files, final checkpoint and events. It now retains run artifacts and
-an EDN result under `docs/runtime-smoke-evidence/`, while deleting only the
+an EDN result under `evidence/runtime-smoke-evidence/`, while deleting only the
 model's temporary working directory.
 
 Fresh local-model verification passes 1 test/20 assertions against the configured
@@ -37,7 +37,7 @@ Fresh local-model verification passes 1 test/20 assertions against the configure
 provider registry supplied the endpoint; absence of overrides is not absence
 of configuration. The initial sandbox DNS failure is recorded separately from
 the successful network-enabled run. The successful evidence is
-[result.edn](runtime-smoke-evidence/llamacpp-qwen3.8-27b-1789239367502/result.edn),
+result.edn (local output: `evidence/runtime-smoke-evidence/llamacpp-qwen3.8-27b-1789239367502/result.edn`),
 with complete stage artifacts and checkpoint in its sibling `logs/` directory.
 The implementation response contains the hello-world source and review confirms
 it. This establishes the runtime's real-LLM smoke journey; it does not establish

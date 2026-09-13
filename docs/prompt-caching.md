@@ -36,9 +36,9 @@ field mappings while following [Anthropic's token-accounting formula](https://pl
 
 Messages gateway verification on Claude Haiku 4.5 passes: turn five reports
 19092 cached tokens out of 19178 total prompt tokens (99.55%). Evidence:
-`provider-cache-protocol-evidence.edn`. The same report records the first
+`evidence/provider-cache-protocol-evidence.edn`. The same report records the first
 Responses failure. The Responses follow-up in
-`provider-cache-responses-evidence.edn` reports cache hits on completed turns,
+`evidence/provider-cache-responses-evidence.edn` reports cache hits on completed turns,
 but GPT-4.1 mini claims a later tool result without executing the tool, so the
 journey fails before establishing five-turn evidence. Opaque per-turn tool
 results prevent predictable output from substituting for execution; the verifier
@@ -50,7 +50,7 @@ map with `required` on each turn's initial request and `none` after the tool
 result, making tool use a request requirement instead of an optional model
 decision. The same five-turn/cache thresholds pass through the Responses
 gateway on GPT-4.1: 16256 cached of 16340 prompt tokens on turn five (99.49%).
-Evidence: `provider-cache-responses-gpt41-evidence.edn`. This supersedes the
+Evidence: `evidence/provider-cache-responses-gpt41-evidence.edn`. This supersedes the
 pending Responses cache conclusion above; failed automatic-selection runs
 remain preserved. It proves this configured gateway/model path, not direct
 first-party endpoints or Gemini caching.

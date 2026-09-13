@@ -1,5 +1,7 @@
 attractor_runs/
 smoke_test_run_dir/
+# Generated verification reports and live-run artifacts are local/CI output.
+evidence/
 bin/
 .nrepl-port
 *.log

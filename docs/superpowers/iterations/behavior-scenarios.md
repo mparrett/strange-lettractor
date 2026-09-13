@@ -290,7 +290,7 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
   completed A remaining successful after B abort, and unadmitted creator A losing
   cleanup authority when B adopts its published session (with no-adopter control)
 - Status: complete CAL-OWN-01 component, 5 tests / 85 assertions; not full shutdown
-- See `docs/turn-ownership-evidence.edn` for reusable commands and baseline
+- See `evidence/turn-ownership-evidence.edn` for reusable commands and baseline
 
 ### SCN-TOOL-HOOKS-STDIN — Native input transport component
 

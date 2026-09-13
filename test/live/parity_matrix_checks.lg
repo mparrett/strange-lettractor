@@ -1,0 +1,27 @@
+(ns live.parity-matrix-checks
+  (:require [clojure.string :as str]
+            [attractor.profiles :as profiles]))
+
+(defn profile-for [protocol provider model]
+  ;; Transport aliases must not silently substitute the generic tool profile.
+  ;; Keep the alias as :id because sessions use that field to route requests.
+  (assoc (profiles/create-profile
+           (case protocol
+             :openai-responses "openai"
+             :anthropic-messages "anthropic"
+             :gemini-generate-content "gemini"
+             provider)
+           model)
+         :id provider))
+
+(defn recovery-evidence [history expected]
+  (loop [rounds (filter #(= :tool_results (:type %)) history) failed nil]
+    (when-let [round (first rounds)]
+      (let [reads (filter #(= "read_file" (:tool_name %)) (:results round))
+            recovered (when failed
+                        (some #(when (and (false? (:is_error %))
+                                         (str/includes? (str (:content %)) expected)) %) reads))]
+        (if recovered
+          {:failed_call (:tool_call_id failed) :recovered_call (:tool_call_id recovered)
+           :recovered_text expected}
+          (recur (rest rounds) (or failed (some #(when (true? (:is_error %)) %) reads))))))))

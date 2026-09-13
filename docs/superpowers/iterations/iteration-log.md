@@ -23,7 +23,7 @@ description loss in plural/batch normalization. All repairs have reusable tests.
 Focused and standalone bundle pass 14 tests / 439 assertions; impacted runner
 passes 217/1667; default full suite passes 667/6507 against baseline 653/6068.
 All terminal exits are zero; CLI build/help and paired per-task spec/quality gates
-pass. `docs/read-file-contract-evidence.edn` records the staged evidence.
+pass. `evidence/read-file-contract-evidence.edn` records the staged evidence.
 
 No let-go runtime defect was identified or runtime source changed. Recognition
 covers PNG/JPEG/GIF/WebP signatures, not image decoding or universal provider
@@ -113,7 +113,7 @@ and standalone bundled regression: 5 tests / 85 assertions. Fresh impacted suite
 have zero failures and exit 0. CLI build/help pass; native-Go AOT conformance is
 not inferred. Paired scope/spec/quality reviews approve; review added the missing
 fresh-publication/adoption and unused-session cleanup controls. Reusable evidence
-and commands are in `docs/turn-ownership-evidence.edn`.
+and commands are in `evidence/turn-ownership-evidence.edn`.
 Paired final three-tier component audit is clean.
 
 This completes the ownership component, not ITER-0008 or the Attractor goal.
@@ -232,7 +232,7 @@ Evidence: baseline 616/5753/0; standalone core 12/85/0; workflow 11/47/0; combin
 and external-directory bundle 23/132/0; impacted agent/engine/status/recovery
 203/1579/0; full default suite 639/5885/0. CLI build/help pass. Paired spec and
 quality reviews approve. `docs/tool-hooks.md` documents use and
-`docs/tool-hooks-evidence.edn` records reusable verification.
+`evidence/tool-hooks-evidence.edn` records reusable verification.
 
 ITER-0007 and the full goal remain incomplete. Audit discovered a separately
 verified preexisting stale-turn cancellation race at the completion callback
@@ -256,7 +256,7 @@ both admission orderings and old/new public waiter selection.
 Evidence: baseline 667/6507; focused/bundle 12/106; impacted 166/1044; default full
 suite 679/6613, zero failures and terminal exit 0. CLI build/help pass. The first
 impacted run correctly caught a turn-count ordering regression; it was repaired,
-not waived. See `docs/subagent-lifecycle-evidence.edn` for commands and scope.
+not waived. See `evidence/subagent-lifecycle-evidence.edn` for commands and scope.
 Profile/model/directory fidelity, remaining depth/live proof, general event
 shutdown and native-Go AOT parity remain open. No console/TUI code is included.
 

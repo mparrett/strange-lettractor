@@ -1,7 +1,7 @@
 # Unified provider evidence audit
 
 Audited 2026-09-12 against unified-llm-spec §§8.6, 8.9 and the retained
-`provider-matrix-evidence.edn`. Historical records are preserved as observations;
+`evidence/provider-matrix-evidence.edn`. Historical records are preserved as observations;
 their pass labels are not accepted without checking the predicate used.
 
 The live runner had a false-positive reasoning predicate: it checked arithmetic
@@ -61,7 +61,7 @@ normalization; the prompt does not supply either answer. Regression checks
 reject missing or substituted URLs, missing answers, and incorrect subject or
 color (provider-evidence namespace: 12 tests/75 assertions).
 
-`provider-url-image-evidence.edn` records two live passes: Messages/Claude
+`evidence/provider-url-image-evidence.edn` records two live passes: Messages/Claude
 Haiku 4.5 and Responses/GPT-4.1 mini both answer `cat, orange`, with URL
 serialization verified. This proves successful URL-image requests and expected
 answers on those gateway paths; it does not independently witness the provider's
@@ -80,7 +80,7 @@ The PNG was generated with Go's standard `image/png` encoder and visually
 inspected; its base64 bytes are embedded in the native let-go runner. No
 generator or external imaging dependency is needed to execute the journey.
 
-Fresh gateway results are retained in `provider-image-content-evidence.edn`:
+Fresh gateway results are retained in `evidence/provider-image-content-evidence.edn`:
 Messages/Claude Haiku 4.5 answered `red, blue` and passed. Responses/GPT-4.1 mini
 answered `orange, lightblue` and failed. The failure is retained; the test was
 not relaxed to accept it. This establishes one successful adapter/model path
@@ -94,7 +94,7 @@ PNG and correct media type in its protocol-specific field. This check runs on
 every attempted image request. The verifier tests reject changed and missing
 payloads for all three native formats (10 tests/60 assertions overall).
 
-`provider-image-wire-evidence.edn` retains the live result: both Responses and
+`evidence/provider-image-wire-evidence.edn` retains the live result: both Responses and
 Messages report `:image_payload_verified true`. Messages again passes; Responses
 answers `blue,red` and fails the spatial-order check. This excludes corruption
 by our serializer for those requests. It does not distinguish gateway image
@@ -113,7 +113,7 @@ the reasoning cases. Fixture tokens use `ids/uuid-text`, because this runtime's
 plain UUID string conversion includes EDN reader syntax.
 
 The corrected live journey passes on `llamacpp/qwen3.8-27b`:
-[retained result](provider-multi-round-local-evidence.edn). This establishes the
+retained result (local output: `evidence/provider-multi-round-local-evidence.edn`). This establishes the
 local Chat Completions path, not all three native provider matrix cells.
 Focused runs can set `ATTRACTOR_MATRIX_JOURNEYS=multi-round-tools` and an
 `ATTRACTOR_MATRIX_EVIDENCE` path to preserve the broader historical report.
@@ -129,7 +129,7 @@ signals as false evidence. The result verifier also requires both successful
 results in the first step and both complete values in the final answer.
 
 The live local-model journey passes on `llamacpp/qwen3.8-27b` in 3357ms:
-[retained result](provider-parallel-local-evidence.edn). Regression checks prove
+retained result (local output: `evidence/provider-parallel-local-evidence.edn`). Regression checks prove
 the overlap barrier accepts simultaneous entry and rejects a missing peer;
 they also reject split rounds, error results and unused output. The combined
 provider evidence checks pass 4 tests/20 assertions. This is local Chat
@@ -145,7 +145,7 @@ wrong arguments, reordered events, unused streamed output and mismatched final
 output all fail the evidence checks.
 
 Live local llama.cpp verification passes in 3639ms:
-[retained result](provider-streaming-tools-local-evidence.edn), including the
+retained result (local output: `evidence/provider-streaming-tools-local-evidence.edn`), including the
 ordered event types, tool-end/step-finish positions and returned opaque value.
 Combined verifier checks pass 5 tests/26 assertions. As with the other new
 journeys, this establishes the local Chat Completions path; native-provider
@@ -155,7 +155,7 @@ cells and the remaining image, caching, usage and options rows stay open.
 
 Fresh verification runs all three new tool journeys through both native
 protocol adapters against OpenRouter's compatible endpoints. All six pass,
-with no skips: [retained results](provider-tool-protocol-evidence.edn).
+with no skips: retained results (local output: `evidence/provider-tool-protocol-evidence.edn`).
 Models: `or-responses/openai/gpt-4.1-mini` and
 `or-messages/anthropic/claude-haiku-4.5`. Each result retains its relevant
 event sequence, overlapping result values or dependent round indices.
@@ -190,12 +190,12 @@ returned zero reasoning tokens even on GPT-5.2, so it did not prove accounting.
 
 Responses gateway verification now passes on `openai/gpt-5.2`, reporting 1183
 reasoning tokens with no visible reasoning text:
-[retained result](provider-reasoning-responses-evidence.edn). This is direct
+retained result (local output: `evidence/provider-reasoning-responses-evidence.edn`). This is direct
 evidence of the native Responses usage field being exposed through the client.
 
 Messages gateway verification on Haiku 4.5 reports an estimated 678 reasoning
 tokens, but returns the incorrect residue 385, so the complete journey remains
-failed: [diagnostic result](provider-reasoning-messages-evidence.edn). The SDK
+failed: diagnostic result (local output: `evidence/provider-reasoning-messages-evidence.edn`). The SDK
 estimates Anthropic reasoning-token counts from thinking-block text as the
 pinned spec requires; this is not a provider-reported exact token breakdown.
 The failure is a model arithmetic result, not proof of a transport failure.
@@ -211,7 +211,7 @@ headers and credentials are not recorded. The journey requires both matching
 wire fields and a nonempty successful model response.
 
 Responses and Messages gateway checks both pass:
-[retained wire options](provider-options-protocol-evidence.edn). Responses uses
+retained wire options (local output: `evidence/provider-options-protocol-evidence.edn`). Responses uses
 `metadata.audit_token`; Messages uses the native `metadata.user_id` field with
 a synthetic UUID, not a person's identifier. The implemented Gemini journey
 uses a native safety-settings option but still lacks a credentialed live run.
@@ -223,13 +223,13 @@ portable-setting overrides and beta headers. Combined verifier checks pass
 ## Stronger-model follow-up
 
 The existing image and reasoning predicates were rerun without relaxing them.
-`provider-capable-image-followup.edn` records base64-image passes for both
+`evidence/provider-capable-image-followup.edn` records base64-image passes for both
 `or-responses/openai/gpt-5.2` and `or-messages/anthropic/claude-opus-4.6`.
 Both serialized image payloads match the fixture and both answers are
 `red, blue`. This supplies successful live evidence for each native adapter's
 image path through the gateway while preserving the earlier Mini failures.
 
-`provider-capable-model-followup.edn` contains reasoning-only results:
+`evidence/provider-capable-model-followup.edn` contains reasoning-only results:
 GPT-5.2 passes with 1172 reported reasoning tokens. Opus 4.6 returns the correct
 residue 353 and an estimated 296 reasoning tokens, but also supplies an
 explanation despite the requested final-integer-only response. The strict
@@ -239,7 +239,7 @@ No hidden thinking blocks are retained in the report.
 
 A direct Anthropic preflight using the configured `claude-gw` alias reaches
 `api.anthropic.com` and fails with the low-credit-balance response, classified as
-`quota-exceeded`: `provider-direct-anthropic-preflight.edn`. The sandbox DNS
+`quota-exceeded`: `evidence/provider-direct-anthropic-preflight.edn`. The sandbox DNS
 failure was followed by this network-authorized check. Direct first-party
 completion is still not established. OpenAI and Gemini built-ins have no
 configured credentials in this environment.

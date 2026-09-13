@@ -34,7 +34,7 @@ missing raw evidence. Anthropic's estimated reasoning count is not compared to
 an exact raw field that the protocol does not provide.
 
 Both Responses and Messages gateway runs pass:
-[retained raw and normalized counters](provider-usage-protocol-evidence.edn).
+retained raw and normalized counters (local output: `evidence/provider-usage-protocol-evidence.edn`).
 Regression fixtures cover all three native mappings, reject a wrong input/output
 split with a plausible total, and reject absent raw data. Combined provider
 evidence checks pass 7 tests/39 assertions. This verifies adapter fidelity to

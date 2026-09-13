@@ -1,0 +1,27 @@
+(ns attractor.parity-matrix-evidence-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.profiles :as profiles]
+            [live.parity-matrix-checks :as checks]))
+
+(deftest protocol-profiles-keep-native-tools-and-alias-routing
+  (doseq [[protocol native edit] [[:openai-responses "openai" "apply_patch"]
+                                 [:anthropic-messages "anthropic" "edit_file"]
+                                 [:gemini-generate-content "gemini" "edit_file"]]]
+    (let [profile (checks/profile-for protocol "gateway" "model")]
+      (is (= "gateway" (:id profile)))
+      (is (= "model" (:model profile)))
+      (when profile
+        (is (= (set (map :name (profiles/profile-tools (profiles/create-profile native "model"))))
+               (set (map :name (profiles/profile-tools profile)))))))))
+
+(deftest recovery-requires-a-later-successful-tool-round
+  (let [failed {:tool_name "read_file" :tool_call_id "missing" :is_error true :content "missing file"}
+        success {:tool_name "read_file" :tool_call_id "found" :is_error false :content "1 | recovered-token"}
+        round (fn [results] {:type :tool_results :results results})]
+    (is (= {:failed_call "missing" :recovered_call "found" :recovered_text "recovered-token"}
+           (checks/recovery-evidence [(round [failed]) {:type :assistant} (round [success])] "recovered-token")))
+    (doseq [history [[] [(round [success])] [(round [failed])] [(round [failed success])]
+                     [(round [success]) (round [failed])]
+                     [(round [failed]) (round [(assoc success :is_error true)])]
+                     [(round [failed]) (round [(assoc success :content "wrong file")])]]]
+      (is (nil? (checks/recovery-evidence history "recovered-token"))))))
