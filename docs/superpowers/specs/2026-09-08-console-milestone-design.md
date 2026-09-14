@@ -3,7 +3,7 @@
 Goal (user, 2026-09-08): implement enough of the Attractor specification that
 the remainder can be finished from a strange-lettractor UI. This document is
 the implementation slice of the approved
-[console and workers design](../../console-workers-design.md); it changes no
+[console and workers design](../../console-features.md); it changes no
 ownership decision there. The console remains a client of the hub.
 
 ## What "enough" means for this milestone

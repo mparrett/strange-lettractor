@@ -29,7 +29,7 @@ No general scheduler service or external dependency.
 
 Upstream limitation: local `async/map` registers its worker in the process root
 and escapes child-scope ownership, as independently reproduced in
-[supervision compatibility](../../let-go-supervision-compatibility.md).
+[supervision compatibility](../../let-go-runtime-issues.md).
 The scheduler uses scoped `future`/`go` primitives. The no-late-work contract is
 proved for owned workers and registered descendants, not detached/root-owned
 work launched by arbitrary custom callbacks. The upstream helper ownership gap

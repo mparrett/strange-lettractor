@@ -15,7 +15,7 @@ parity-runner-only changes. The fresh pinned-runtime result below is separate.
 Update 2026-09-12: the execution audit found an original-scope cross-feature defect
 despite completed story statuses: manager-started children bypassed transforms
 and validation. It is now fixed with failing-before/passing-after and compiled
-CLI evidence. See [runtime-execution-audit.md](runtime-execution-audit.md).
+CLI evidence. See [runtime-execution-audit.md](runtime-audits.md).
 The status ledger must not be used as proof that no implementation gaps remain.
 
 Latest integrated verification: `make test` passes 1145 tests and 10284 assertions

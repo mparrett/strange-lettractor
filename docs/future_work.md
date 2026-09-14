@@ -129,6 +129,16 @@ and when it exits, how a hub is discovered (`.attractor/hub.sock` under the
 repository root is the obvious default), whether `serve` becomes the hub's
 HTTP face, and how to authorise clients on a shared machine.
 
+## Evaluation harness extension (requested 2026-09-13)
+
+The first-party NLSpec is [`evaluation-harness-extension.md`](evaluation-harness-extension.md).
+It defines independent run evaluation, multidimensional scoring, benchmark and
+harness comparison, and staged support for skills, read-only MCP, and
+capability-restricted generated let-go modules. It is intentionally separate
+from the external ASDLC reference dataset. Implement Slice A (evaluation
+records and deterministic scoring) before skills, MCP, generated code, or
+self-evolution.
+
 ## Self-improving harness (requested 2026-09-08)
 
 The premise: Attractor now drives external agents and its own native loop

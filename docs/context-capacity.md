@@ -45,7 +45,7 @@ between discovery and generation.
 
 Native discovery requires scope-aware HTTP client vars marked with
 `:scope-cancellation true`. Until the local let-go fixes are upstream, use the
-runtime documented in [HTTP cancellation](let-go-http-cancellation.md). Older
+runtime documented in [HTTP cancellation](let-go-runtime-issues.md). Older
 runtimes report `:runtime-prerequisite` without starting an HTTP request.
 
 With `LGX_LG` set to the fixed runtime, run:

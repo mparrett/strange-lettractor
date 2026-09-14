@@ -62,7 +62,7 @@ Public contract:
   Implementation evidence (2026-09-07): mutable chunk buffers are affected by
   [nooga/let-go#813](https://github.com/nooga/let-go/issues/813). Until fixed,
   use buffered `ReadByte` with bounded frame accumulation, not `.Read` into a
-  copied byte-array. See [reproducer and return point](../../let-go-byte-array-interop.md).
+  copied byte-array. See [reproducer and return point](../../let-go-runtime-issues.md).
 - [ ] Use let-go supervision patterns already exercised by `src/attractor/handlers.lg`, `src/attractor/agent.lg`, and their cancellation tests. Keep mutable pending state and callbacks out of competing writers. Bound the inbound queue to 64 frames; overflow fails the connection, settles pending requests and cleans up, never dropping frames silently. Test a paused internal consumer. Internal consumers must be cancellation-aware; do not run arbitrary user callbacks inline. Closing pipes must unblock reader workers before joining them.
 - [ ] Add red cases for child launch failure, callback exception, repeated close, a blocked reader, and a child ignoring EOF. Close is idempotent; a deadline escalates to killing only the owned child and `.Wait` reaps it. If kill/reap fails, return a typed shutdown error instead of claiming `:reaped? true`.
   Runtime prerequisite discovered 2026-09-07:

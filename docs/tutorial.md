@@ -264,7 +264,7 @@ applied. Failed or cancelled children contribute no mapped outputs.
 
 The temporary mapping reader supports ordinary string-to-string maps, comments,
 commas, and string escapes. Metadata and reader discards are not yet supported;
-see the [Clojure reader compatibility findings](let-go-reader-compatibility.md).
+see the [Clojure reader compatibility findings](let-go-runtime-issues.md).
 Engine-owned destination keys such as `run.id`, `current_node`, and `graph.*`
 cannot be mapped over.
 

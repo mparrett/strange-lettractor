@@ -24,6 +24,7 @@
             [attractor.dotenv :as dotenv]
             [attractor.ids :as ids]
             [attractor.providers :as providers]
+            [attractor.skills :as skills]
             [clojure.core :as core]))
 
 (defn- find-arg-val [args flag]
@@ -369,6 +370,7 @@
   (println "  hub --stop PORT                                    Request graceful hub shutdown")
   (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
   (println "  providers                                           Show the effective provider registry (attractor.edn)")
+  (println "  skills [approvals|approve <id> --winner r|revoke <id>]  List skills; review, approve, or revoke approvals")
   (println (str "  agent <" (str/join "|" (registry/agent-names)) "> --prompt-file <file>          Run one external agent job, EDN events"))
   (println "    [--cwd <dir>] [--model <m>] [--timeout-ms <ms>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--sandbox read-only|workspace-write|danger-full-access] [--approval-policy never|on-request|untrusted]")
@@ -592,6 +594,109 @@
     (println "Cleanup complete.")
     (os/exit 0)))
 
+(defn- cli-skills-project-root []
+  (let [top (try
+              (let [result (os/sh "/bin/bash" "-c" "git rev-parse --show-toplevel")]
+                (when (= 0 (:exit result))
+                  (let [trimmed (str/trim (or (:out result) ""))]
+                    (when-not (str/blank? trimmed) trimmed))))
+              (catch Object _ nil))]
+    (skills/project-skills-root top (os/cwd))))
+
+(defn- cli-skills-access []
+  (skills/local-file-access))
+
+(defn- cmd-skills-list [roots access]
+  (let [discovered (skills/discover roots)]
+    (println "Skills (project root, then user root):")
+    (println (str "  project: " (:project-root roots)))
+    (println (str "  user:    " (or (:user-root roots) "(no home configured)")))
+    (println (skills/format-roster-table discovered))
+    (os/exit 0)))
+
+(defn- cmd-skills-approvals [access]
+  (let [path (skills/default-approvals-path)
+        approvals (skills/read-approvals
+                    (:read-text access) (:file-exists access) path)]
+    (println (str "Skill approvals (" (or path "(no home configured)") "):"))
+    (if (empty? approvals)
+      (println "  (none)")
+      (doseq [[id approval] (sort-by first approvals)]
+        (println (str "  " id " -> " (:winning-root approval)))
+        (println (str "    project: " (:project-digest approval)))
+        (println (str "    user:    " (:user-digest approval)))))
+    (os/exit 0)))
+
+(defn- cmd-skills-approve [args access]
+  (let [id (second args)
+        winner (find-arg-val args "--winner")
+        path (skills/default-approvals-path)]
+    (when (str/blank? (or id ""))
+      (do (println "Usage: attractor skills approve <skill-id> --winner project|user")
+          (os/exit 1)))
+    (when (nil? path)
+      (do (println "Cannot approve: no home directory is configured.")
+          (os/exit 1)))
+    (let [roots {:project-root (cli-skills-project-root)
+                 :user-root (skills/user-skills-root)}
+          entry (try
+                  (skills/propose-approval
+                    (assoc roots
+                           :read-text (:read-text access)
+                           :file-exists (:file-exists access))
+                    id winner)
+                  (catch Object error
+                    (println (str "Cannot approve: " (ex-message error)))
+                    (os/exit 1)))
+          approvals (skills/read-approvals
+                      (:read-text access) (:file-exists access) path)]
+      (skills/write-approvals! path (merge approvals entry))
+      (println (str "Approved skill " id " -> " winner))
+      (println (str "  project: " (get-in entry [id :project-digest])))
+      (println (str "  user:    " (get-in entry [id :user-digest])))
+      (os/exit 0))))
+
+(defn- cmd-skills-revoke [args access]
+  (let [id (second args)
+        path (skills/default-approvals-path)]
+    (when (str/blank? (or id ""))
+      (do (println "Usage: attractor skills revoke <skill-id>")
+          (os/exit 1)))
+    (when (nil? path)
+      (do (println "Cannot revoke: no home directory is configured.")
+          (os/exit 1)))
+    (let [approvals (skills/read-approvals
+                      (:read-text access) (:file-exists access) path)]
+      (if (contains? approvals id)
+        (do (skills/write-approvals! path (skills/revoke-approval approvals id))
+            (println (str "Revoked skill approval: " id))
+            (os/exit 0))
+        (do (println (str "No approval recorded for skill: " id))
+            (os/exit 1))))))
+
+(defn cmd-skills
+  "skills: list discoverable skills; `skills approvals` reviews the sticky
+   cross-root approvals; `skills approve <id> --winner project|user` records
+   one; `skills revoke <id>` revokes one."
+  [args]
+  (let [access (cli-skills-access)
+        roots {:project-root (cli-skills-project-root)
+               :user-root (skills/user-skills-root)
+               :read-text (:read-text access)
+               :file-exists (:file-exists access)
+               :list-dir (:list-dir access)}
+        sub (first args)]
+    (if (nil? sub)
+      (cmd-skills-list roots access)
+      (if (= "approvals" sub)
+        (cmd-skills-approvals access)
+        (if (= "approve" sub)
+          (cmd-skills-approve args access)
+          (if (= "revoke" sub)
+            (cmd-skills-revoke args access)
+            (do (println "Usage: attractor skills [approvals|approve <skill-id> --winner project|user|revoke <skill-id>]")
+                (os/exit 1))))))))
+
 (defn cmd-providers
   "providers: show the effective provider registry with each value's source."
   [_]
@@ -689,6 +794,7 @@
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)
       "providers" (cmd-providers rest-args)
+      "skills" (cmd-skills rest-args)
       "agent" (cmd-agent rest-args)
       "console" (cmd-console rest-args)
       "help" (print-usage)

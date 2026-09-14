@@ -1,5 +1,5 @@
 (ns attractor.agent
-  (:require [attractor.ids :as ids] [clojure.string :as str]
+  (:require [attractor.ids :as ids] [attractor.skills :as skills] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
@@ -346,7 +346,7 @@
      :model_display_name model_display_name
      :knowledge_cutoff knowledge_cutoff}))
 
-(defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions]
+(defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions skills-block]
   (let [base (profiles/build-system-prompt profile environment [])
         tool-text
         (str/join "\n"
@@ -374,6 +374,8 @@
            (str "\n\n<project_instructions>\n"
                 (str/join "\n\n" project-docs)
                 "\n</project_instructions>"))
+         (when-not (str/blank? skills-block)
+           (str "\n\n" skills-block))
          (when-not (str/blank? user-instructions)
            (str "\n\n" user-instructions)))))
 
@@ -451,6 +453,33 @@
             (vec (:project_docs options))
             (discover-project-docs environment (:id profile)))
           snapshot (environment-snapshot environment profile)
+          selected-skills (vec (or (:skills options) []))
+          skill-access (skills/env-file-access environment)
+          skill-roots {:project-root (or (:project_skills_root options)
+                                         (skills/project-skills-root
+                                           (environment-command environment "git rev-parse --show-toplevel")
+                                           ((:working_directory environment))))
+                       :user-root (or (:user_skills_root options)
+                                      (skills/user-skills-root))}
+          skill-approvals (if (contains? options :skill_approvals)
+                            (or (:skill_approvals options) {})
+                            (skills/read-default-approvals skill-access))
+          skill-result (when (seq selected-skills)
+                         (skills/load-selected
+                           selected-skills
+                           (assoc skill-roots
+                                  :read-text (:read-text skill-access)
+                                  :file-exists (:file-exists skill-access)
+                                  :list-dir (:list-dir skill-access)
+                                  :approvals skill-approvals)))
+          skill-roster (skills/discover
+                         (assoc skill-roots
+                                :read-text (:read-text skill-access)
+                                :file-exists (:file-exists skill-access)
+                                :list-dir (:list-dir skill-access)))
+          skill-roster-render (skills/render-roster skill-roster)
+          skills-block (skills/render-skills-block
+                         {:roster skill-roster :loaded (vec (:loaded skill-result))})
           session
           (atom {:id (or (:id options) (ids/prefixed "agent"))
                  :model (:model profile)
@@ -467,6 +496,14 @@
                  :listener_errors (atom [])
                  :context_warning_emitted (atom false)
                  :project_docs project-docs
+                 :skills_loaded (vec (:loaded skill-result))
+                 :skill_roster skill-roster
+                 :skill_roster_evidence (skills/roster-evidence skill-roster skill-roster-render)
+                 :skills_block skills-block
+                 :skill_evidence (vec (:evidence skill-result))
+                 :skill_approvals skill-approvals
+                 :skill_roots skill-roots
+                 :skills_config_digest (:config-digest skill-result)
                  :environment_snapshot snapshot
                  :state :idle
                  :current_turn_owner nil
@@ -496,6 +533,11 @@
       (when (< (:subagent_depth @session)
                (or (get-in @session [:config :max_subagent_depth]) 1))
         (register-subagent-tools! session))
+      (when (seq selected-skills)
+        (emit-event! session {:type :skills_loaded
+                              :skills (:skill_evidence @session)
+                              :roster (:skill_roster_evidence @session)
+                              :config_digest (:skills_config_digest @session)}))
       (emit-event! session {:type :session_start})
       session)))
 
@@ -1045,7 +1087,8 @@
                         profile environment
                         (:environment_snapshot @session)
                         (:project_docs @session)
-                        (:user_instructions config))
+                        (:user_instructions config)
+                        (:skills_block @session))
                       request {:model (:model profile)
                                :provider (:id profile)
                                :messages
@@ -1251,6 +1294,20 @@
   (launch-subagent-run! parent
     (with-session-lock parent #(admit-subagent-run! parent agent-id input))))
 
+(defn child-skill-options
+  "Skill options a subagent child inherits so its selected context matches
+   the parent's: the same selected ids, sticky approvals, and resolved
+   roots. The child's own load evidence describes the child context.
+   Returns {} when the parent selected no skills."
+  [parent]
+  (let [selected (vec (or (get-in @parent [:config :skills]) []))]
+    (if (empty? selected)
+      {}
+      {:skills selected
+       :skill_approvals (or (:skill_approvals @parent) {})
+       :project_skills_root (get-in @parent [:skill_roots :project-root])
+       :user_skills_root (get-in @parent [:skill_roots :user-root])})))
+
 (defn spawn-subagent! [parent arguments]
   (with-session-lock parent #(parent-open! parent))
   (let [depth (:subagent_depth @parent)
@@ -1283,8 +1340,9 @@
           child-id (ids/prefixed "agent")
           child
           (make-session
-            {:id child-id
-             :tool_hook_context (:tool_hook_context @parent)
+            (merge
+             {:id child-id
+              :tool_hook_context (:tool_hook_context @parent)
              :provider_profile child-profile
              :execution_env child-environment
              :llm_client (:llm_client @parent)
@@ -1300,7 +1358,8 @@
                  (emit-event! parent
                               {:type :subagent_event
                                :agent_id child-id
-                               :event event})))})
+                               :event event}))) }
+              (child-skill-options parent)))
           agent-id (:id @child)]
       (let [admission
             (try

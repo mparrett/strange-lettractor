@@ -1,0 +1,521 @@
+(ns attractor.skills-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.edn :as edn]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]
+            [attractor.skills :as skills]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; ---------------------------------------------------------------------------
+;; Fixture helpers: real temp skill roots on disk.
+;; ---------------------------------------------------------------------------
+
+(defn- fresh-dir [label]
+  (str (os/temp-dir) "/skills-" label "-" (random-uuid)))
+
+(defn- write-skill! [root id manifest files]
+  (let [dir (str root "/" id)]
+    (io/mkdir dir)
+    (io/spit (str dir "/skill.edn") (pr-str manifest))
+    (doseq [[path content] files]
+      (io/spit (str dir "/" path) content))
+    dir))
+
+(defn- manifest-for [id files]
+  {:id id :revision "2026-09-14"
+   :name (str "Skill " id) :description (str "Does " id " things.")
+   :invocation {:task-types ["review"] :keywords [id]}
+   :inputs [] :files files
+   :requires {:tools [] :mcp []} :outputs [] :limits {:max-kb 8}
+   :provenance {:author "test" :license "MIT" :source-url "https://example.invalid"}})
+
+(defn- files-with-digests [pairs]
+  (mapv (fn [[path content]] {:path path :sha256 (hash/sha256 content)}) pairs))
+
+(defn- make-roots []
+  (let [base (fresh-dir "roots")]
+    {:project (str base "/proj/.attractor/skills")
+     :user (str base "/user/.attractor/skills")}))
+
+(defn- access []
+  {:read-text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+   :file-exists (fn [path] (some? (os/stat path)))
+   :list-dir (fn [path]
+               (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                              (os/ls path)))
+                    (catch Object _ [])))})
+
+(defn- opts [roots & [extra]]
+  (merge {:project-root (:project roots) :user-root (:user roots)
+          :approvals {}} (access) extra))
+
+(defn- journey-env []
+  (execution/make-environment
+    {:working_directory (fn [] "/repo")
+     :file_exists (fn [path] (some? (try (os/stat path) (catch Object _ nil))))
+     :read_text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+     :list_directory (fn [path _depth]
+                       (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                                      (os/ls path)))
+                            (catch Object _ [])))
+     :inspect_command (fn [_] {:exit_code 1 :stdout ""})}))
+
+;; ---------------------------------------------------------------------------
+;; Manifest validation (data-only schema).
+;; ---------------------------------------------------------------------------
+
+(deftest manifest-missing-required-fields-is-rejected
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        _ (write-skill! (:project roots) "demo"
+                        (dissoc (manifest-for "demo" (files-with-digests pairs)) :description)
+                        pairs)
+        err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+    (is (= :skill-manifest-invalid (:category (ex-data err))))))
+
+(deftest manifest-id-must-match-its-directory
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        _ (write-skill! (:project roots) "demo"
+                        (manifest-for "other" (files-with-digests pairs)) pairs)
+        err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+    (is (= :skill-id-mismatch (:category (ex-data err))))))
+
+(deftest manifest-rejects-absolute-and-parent-file-paths
+  (doseq [bad ["/etc/passwd" "../escape.md" "a/../../b.md"]]
+    (let [roots (make-roots)
+          pairs [["SKILL.md" "Body."]]
+          files (conj (files-with-digests pairs) {:path bad :sha256 (hash/sha256 "x")})
+          _ (write-skill! (:project roots) "demo" (manifest-for "demo" files) pairs)
+          err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+      (is (= :skill-manifest-invalid (:category (ex-data err))) (str "path: " bad)))))
+
+(deftest manifest-requires-skill-md-entry
+  (let [roots (make-roots)
+        pairs [["notes.md" "Only notes."]]
+        _ (write-skill! (:project roots) "demo"
+                        (manifest-for "demo" (files-with-digests pairs)) pairs)
+        err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+    (is (= :skill-manifest-invalid (:category (ex-data err))))))
+
+;; ---------------------------------------------------------------------------
+;; Explicit selection and digest pinning.
+;; ---------------------------------------------------------------------------
+
+(deftest explicit-selection-loads-only-what-is-selected
+  (let [roots (make-roots)
+        a-pairs [["SKILL.md" "Alpha body."]]
+        b-pairs [["SKILL.md" "Beta body."]]
+        _ (write-skill! (:project roots) "alpha" (manifest-for "alpha" (files-with-digests a-pairs)) a-pairs)
+        _ (write-skill! (:project roots) "beta" (manifest-for "beta" (files-with-digests b-pairs)) b-pairs)
+        result (skills/load-selected ["alpha"] (opts roots))]
+    (is (= ["alpha"] (mapv :id (:loaded result))))
+    (is (str/includes? (:body (first (:loaded result))) "Alpha body."))
+    (is (= 1 (count (:evidence result))))))
+
+(deftest unknown-skill-id-fails-closed
+  (let [roots (make-roots)
+        err (try (skills/load-selected ["nope"] (opts roots)) (catch Object e e))]
+    (is (= :skill-not-found (:category (ex-data err))))
+    (is (= "nope" (:skill_id (ex-data err))))))
+
+(deftest tampered-file-is-refused-by-digest
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo"
+                        (manifest-for "demo" [{:path "SKILL.md" :sha256 (hash/sha256 "Original body.")}])
+                        [["SKILL.md" "Tampered body."]])
+        err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+    (is (= :skill-digest-mismatch (:category (ex-data err))))))
+
+(deftest stray-files-outside-the-manifest-are-ignored
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        dir (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        _ (io/spit (str dir "/evil.md") "Not in the manifest.")
+        result (skills/load-selected ["demo"] (opts roots))]
+    (is (= ["demo"] (mapv :id (:loaded result))))
+    (is (not (str/includes? (:body (first (:loaded result))) "evil")))))
+
+;; ---------------------------------------------------------------------------
+;; Precedence: revised P3 — cross-root divergence needs sticky approval.
+;; ---------------------------------------------------------------------------
+
+(deftest same-digest-in-both-roots-loads-once-and-records-agreement
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Shared body."]]
+        m (manifest-for "demo" (files-with-digests pairs))
+        _ (write-skill! (:project roots) "demo" m pairs)
+        _ (write-skill! (:user roots) "demo" m pairs)
+        result (skills/load-selected ["demo"] (opts roots))]
+    (is (= 1 (count (:loaded result))))
+    (is (= "project" (:root (first (:loaded result)))))
+    (is (= :agree (:cross-root (first (:evidence result)))))))
+
+(deftest divergent-roots-fail-closed-without-approval
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo"
+                        (manifest-for "demo" (files-with-digests [["SKILL.md" "Project body."]]))
+                        [["SKILL.md" "Project body."]])
+        _ (write-skill! (:user roots) "demo"
+                        (manifest-for "demo" (files-with-digests [["SKILL.md" "User body."]]))
+                        [["SKILL.md" "User body."]])
+        err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+    (is (= :skill-cross-root-conflict (:category (ex-data err))))
+    (is (= "demo" (:skill_id (ex-data err))))))
+
+(deftest divergent-roots-load-winner-with-matching-sticky-approval
+  (let [roots (make-roots)
+        proj-pairs [["SKILL.md" "Project body."]]
+        user-pairs [["SKILL.md" "User body."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests proj-pairs)) proj-pairs)
+        _ (write-skill! (:user roots) "demo" (manifest-for "demo" (files-with-digests user-pairs)) user-pairs)
+        proj-digest (hash/sha256 (pr-str (manifest-for "demo" (files-with-digests proj-pairs))))
+        user-digest (hash/sha256 (pr-str (manifest-for "demo" (files-with-digests user-pairs))))
+        approvals {"demo" {:winning-root "user" :project-digest proj-digest :user-digest user-digest}}
+        result (skills/load-selected ["demo"] (opts roots {:approvals approvals}))]
+    (is (= "user" (:root (first (:loaded result)))))
+    (is (str/includes? (:body (first (:loaded result))) "User body."))
+    (is (= approvals (:approvals-used (first (:evidence result)))))))
+
+(deftest stale-approval-after-either-side-changes-fails-closed
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo"
+                        (manifest-for "demo" (files-with-digests [["SKILL.md" "Project body v2."]]))
+                        [["SKILL.md" "Project body v2."]])
+        _ (write-skill! (:user roots) "demo"
+                        (manifest-for "demo" (files-with-digests [["SKILL.md" "User body."]]))
+                        [["SKILL.md" "User body."]])
+        approvals {"demo" {:winning-root "user" :project-digest "stale" :user-digest "stale"}}
+        err (try (skills/load-selected ["demo"] (opts roots {:approvals approvals})) (catch Object e e))]
+    (is (= :skill-cross-root-conflict (:category (ex-data err))))))
+
+;; ---------------------------------------------------------------------------
+;; Budgets: per-skill 8KB, total 16KB, hard refusal.
+;; ---------------------------------------------------------------------------
+
+(deftest oversized-skill-body-is-refused-not-truncated
+  (let [roots (make-roots)
+        big (apply str (repeat 9000 "b"))
+        pairs [["SKILL.md" big]]
+        _ (write-skill! (:project roots) "big" (manifest-for "big" (files-with-digests pairs)) pairs)
+        err (try (skills/load-selected ["big"] (opts roots)) (catch Object e e))]
+    (is (= :skill-budget-exceeded (:category (ex-data err))))))
+
+(deftest total-budget-across-skills-is-enforced
+  (let [roots (make-roots)
+        mk (fn [id n] (let [pairs [["SKILL.md" (apply str (repeat n "x"))]]]
+                        (write-skill! (:project roots) id (manifest-for id (files-with-digests pairs)) pairs)))]
+    (mk "s1" 7000) (mk "s2" 7000) (mk "s3" 7000)
+    (let [err (try (skills/load-selected ["s1" "s2" "s3"] (opts roots)) (catch Object e e))]
+      (is (= :skill-budget-exceeded (:category (ex-data err)))))))
+
+;; ---------------------------------------------------------------------------
+;; Evidence and config digest.
+;; ---------------------------------------------------------------------------
+
+(deftest load-evidence-carries-digests-and-winning-root
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        result (skills/load-selected ["demo"] (opts roots))
+        ev (first (:evidence result))]
+    (is (= "demo" (:skill_id ev)))
+    (is (= "2026-09-14" (:revision ev)))
+    (is (= 64 (count (:manifest-digest ev))))
+    (is (= "project" (:root ev)))
+    (is (false? (:truncated ev)))
+    (is (some? (:config-digest result)))))
+
+(deftest config-digest-is-deterministic-and-revision-sensitive
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        d1 (:config-digest (skills/load-selected ["demo"] (opts roots)))
+        d2 (:config-digest (skills/load-selected ["demo"] (opts roots)))]
+    (is (= d1 d2))
+    (let [m2 (assoc (manifest-for "demo" (files-with-digests pairs)) :revision "2026-09-15")
+          _ (write-skill! (:project roots) "demo" m2 pairs)
+          d3 (:config-digest (skills/load-selected ["demo"] (opts roots)))]
+      (is (not (= d1 d3))))))
+
+;; ---------------------------------------------------------------------------
+;; Prompt rendering: roster plus selected bodies, no tool grants.
+;; ---------------------------------------------------------------------------
+
+(deftest skills-block-renders-roster-and-selected-bodies
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Demo procedure."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        result (skills/load-selected ["demo"] (opts roots))
+        roster (skills/discover (opts roots))
+        block (skills/render-skills-block {:roster roster :loaded (:loaded result)})]
+    (is (str/includes? block "<skills>"))
+    (is (str/includes? block "Demo procedure."))
+    (is (str/includes? block "id=\"demo\""))
+    (is (str/includes? block "</skills>"))))
+
+(deftest empty-selection-and-empty-roster-renders-nothing
+  (let [roots (make-roots)
+        block (skills/render-skills-block {:roster [] :loaded []})]
+    (is (nil? block))))
+
+(deftest skill-declarations-grant-no-tools
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        m (assoc (manifest-for "demo" (files-with-digests pairs))
+                 :requires {:tools ["shell" "write_file"] :mcp ["server"]})
+        _ (write-skill! (:project roots) "demo" m pairs)
+        before (atom nil)
+        profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        _ (reset! before (set (profiles/tool-names (:tool_registry profile))))
+        env (journey-env)
+        session (agent/make-session
+                  {:provider_profile profile :execution_env env :max_subagent_depth 0
+                   :project_docs [] :skills ["demo"]
+                   :project_skills_root (:project roots) :user_skills_root (:user roots)
+                   :complete_fn (fn [_] {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (try
+      (is (= @before (set (profiles/tool-names (:tool_registry profile)))))
+      (finally (agent/close-session! session)))))
+
+;; ---------------------------------------------------------------------------
+;; Public-API journey: selected skills reach the system prompt.
+;; ---------------------------------------------------------------------------
+
+(deftest session-system-prompt-contains-selected-skill-bodies
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Follow the demo procedure exactly."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        requests (atom [])
+        env (journey-env)
+        profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        session (agent/make-session
+                  {:provider_profile profile :execution_env env :max_subagent_depth 0
+                   :project_docs [] :skills ["demo"]
+                   :project_skills_root (:project roots) :user_skills_root (:user roots)
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (try
+      (is (= "done" (agent/process-input! session "work")))
+      (let [system-text (get-in @requests [0 :messages 0 :content])
+            block (second (re-find #"(?s)<skills>\n(.*)\n</skills>" system-text))]
+        (is (some? block))
+        (is (str/includes? block "Follow the demo procedure exactly."))
+        (is (some? (:skills_config_digest @session)))
+        (is (= 1 (count (:skill_evidence @session)))))
+      (finally (agent/close-session! session)))))
+
+;; ---------------------------------------------------------------------------
+;; Review fixes: selection grammar, approvals validation, approve flow,
+;; roster evidence, unreadable-vs-absent, subagent inheritance.
+;; ---------------------------------------------------------------------------
+
+(deftest malicious-selected-ids-fail-closed-before-any-read
+  (let [roots (make-roots)
+        reads (atom 0)
+        o (opts roots {:read-text (fn [_] (swap! reads inc) nil)
+                       :file-exists (fn [_] (swap! reads inc) false)})]
+    (doseq [bad ["../x" "a/b" "UPPER" "has space" "" ".." "a\\b"]]
+      (let [err (try (skills/load-selected [bad] o) (catch Object e e))]
+        (is (= :skill-selection-invalid (:category (ex-data err))) (str "id: " bad))))
+    (is (= 0 @reads))))
+
+(deftest duplicate-and-empty-selections-are-rejected
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)]
+    (let [err (try (skills/load-selected ["demo" "demo"] (opts roots)) (catch Object e e))]
+      (is (= :skill-selection-invalid (:category (ex-data err)))))
+    (let [err (try (skills/load-selected [] (opts roots)) (catch Object e e))]
+      (is (= :skill-selection-invalid (:category (ex-data err)))))))
+
+(deftest missing-accessors-fail-closed
+  (let [roots (make-roots)
+        err (try (skills/load-selected ["demo"] {:project-root (:project roots)
+                                                :user-root (:user roots)
+                                                :approvals {}})
+                 (catch Object e e))]
+    (is (= :skill-configuration (:category (ex-data err))))))
+
+(deftest unreadable-manifest-fails-closed-distinct-from-absent
+  (let [roots (make-roots)
+        unreadable (opts roots {:read-text (fn [_] nil)
+                                :file-exists (fn [_] true)})
+        absent (opts roots {:read-text (fn [_] nil)
+                            :file-exists (fn [_] false)})
+        err-unreadable (try (skills/load-selected ["demo"] unreadable) (catch Object e e))
+        err-absent (try (skills/load-selected ["demo"] absent) (catch Object e e))]
+    (is (= :skill-manifest-invalid (:category (ex-data err-unreadable))))
+    (is (= :skill-not-found (:category (ex-data err-absent))))))
+
+(deftest manifest-backslash-and-duplicate-paths-rejected
+  (let [roots (make-roots)]
+    (doseq [files [[{:path "a\\b.md" :sha256 (hash/sha256 "x")}]
+                   [{:path "SKILL.md" :sha256 (hash/sha256 "Body.")}
+                    {:path "SKILL.md" :sha256 (hash/sha256 "Body.")}]]]
+      (let [_ (write-skill! (:project roots) "demo" (manifest-for "demo" files) [["SKILL.md" "Body."]])
+            err (try (skills/load-selected ["demo"] (opts roots)) (catch Object e e))]
+        (is (= :skill-manifest-invalid (:category (ex-data err))))))))
+
+(deftest malformed-approvals-file-fails-closed
+  (let [dir (fresh-dir "approvals")
+        _ (io/mkdir dir)
+        path (str dir "/skill-approvals.edn")
+        reads (atom {})
+        access {:read-text (fn [p] (try (io/slurp p) (catch Object _ nil)))
+                :file-exists (fn [p] (some? (os/stat p)))}]
+    (doseq [bad ["not edn {{{"
+                 "{:bad-key \"x\"}"
+                 (pr-str {"demo" {:winning-root "everywhere"
+                                  :project-digest (apply str (repeat 64 "a"))
+                                  :user-digest (apply str (repeat 64 "b"))}})
+                 (pr-str {"demo" {:winning-root "user" :project-digest "short"}})]]
+      (io/spit path bad)
+      (let [err (try (skills/read-approvals (:read-text access) (:file-exists access) path)
+                     (catch Object e e))]
+        (is (= :skill-approvals-invalid (:category (ex-data err))) (str "content: " (subs bad 0 (min 20 (count bad)))))))
+    (is (= {} (skills/read-approvals (:read-text access) (:file-exists access) (str dir "/missing.edn"))))))
+
+(deftest propose-approval-builds-sticky-entry-for-divergent-id
+  (let [roots (make-roots)
+        proj-pairs [["SKILL.md" "Project body."]]
+        user-pairs [["SKILL.md" "User body."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests proj-pairs)) proj-pairs)
+        _ (write-skill! (:user roots) "demo" (manifest-for "demo" (files-with-digests user-pairs)) user-pairs)
+        entry (skills/propose-approval (opts roots) "demo" "project")]
+    (is (= "project" (get-in entry ["demo" :winning-root])))
+    (is (= 64 (count (get-in entry ["demo" :project-digest]))))
+    (let [result (skills/load-selected ["demo"] (opts roots {:approvals (merge {} entry)}))]
+      (is (= "project" (:root (first (:loaded result))))))
+    (let [bad-winner (try (skills/propose-approval (opts roots) "demo" "nowhere") (catch Object e e))]
+      (is (= :skill-selection-invalid (:category (ex-data bad-winner)))))
+    (let [missing (try (skills/propose-approval (opts roots) "ghost" "project") (catch Object e e))]
+      (is (= :skill-not-found (:category (ex-data missing)))))))
+
+(deftest propose-approval-unneeded-when-roots-agree-or-sole
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Shared body."]]
+        m (manifest-for "demo" (files-with-digests pairs))
+        _ (write-skill! (:project roots) "demo" m pairs)
+        _ (write-skill! (:user roots) "demo" m pairs)
+        solo-pairs [["SKILL.md" "Solo."]]
+        _ (write-skill! (:project roots) "solo" (manifest-for "solo" (files-with-digests solo-pairs)) solo-pairs)]
+    (doseq [id ["demo" "solo"]]
+      (let [err (try (skills/propose-approval (opts roots) id "project") (catch Object e e))]
+        (is (= :skill-approval-unneeded (:category (ex-data err))) (str "id: " id))))))
+
+(deftest roster-entries-carry-digests-and-cross-root-flags
+  (let [roots (make-roots)
+        agree-pairs [["SKILL.md" "Agree body."]]
+        am (manifest-for "agree" (files-with-digests agree-pairs))
+        _ (write-skill! (:project roots) "agree" am agree-pairs)
+        _ (write-skill! (:user roots) "agree" am agree-pairs)
+        dpairs [["SKILL.md" "Project diverges."]]
+        upairs [["SKILL.md" "User diverges."]]
+        _ (write-skill! (:project roots) "div" (manifest-for "div" (files-with-digests dpairs)) dpairs)
+        _ (write-skill! (:user roots) "div" (manifest-for "div" (files-with-digests upairs)) upairs)
+        spairs [["SKILL.md" "Solo body."]]
+        _ (write-skill! (:project roots) "solo" (manifest-for "solo" (files-with-digests spairs)) spairs)
+        roster (skills/discover (opts roots))
+        by-id (into {} (map (fn [e] [(:id e) e]) roster))]
+    (is (= :agree (:cross-root (get by-id "agree"))))
+    (is (= :divergent (:cross-root (get by-id "div"))))
+    (is (= :sole-project (:cross-root (get by-id "solo"))))
+    (is (every? #(= 64 (count (:manifest-digest %))) (vals by-id)))
+    (is (= "project" (:root (get by-id "div"))))))
+
+(deftest roster-caps-single-descriptions
+  (let [roots (make-roots)
+        long-desc (apply str (repeat 600 "d"))
+        pairs [["SKILL.md" "Body."]]
+        m (assoc (manifest-for "demo" (files-with-digests pairs)) :description long-desc)
+        _ (write-skill! (:project roots) "demo" m pairs)
+        roster (skills/discover (opts roots))]
+    (is (= 1 (count roster)))
+    (is (true? (:description-truncated (first roster))))
+    (is (< (count (:description (first roster))) 600))))
+
+(deftest roster-render-marks-truncation-and-evidence-records-it
+  (let [roots (make-roots)]
+    (dotimes [n 60]
+      (let [id (str "s" n) pairs [["SKILL.md" "Body."]]
+            m (assoc (manifest-for id (files-with-digests pairs))
+                     :description (apply str (repeat 100 (str n))))]
+        (write-skill! (:project roots) id m pairs)))
+    (let [roster (skills/discover (opts roots))
+          rendered (skills/render-roster roster)]
+      (is (= 60 (count roster)))
+      (is (true? (:truncated rendered)))
+      (is (> (:omitted rendered) 0))
+      (is (str/includes? (:text rendered) "[roster truncated to fit budget]"))
+      (let [ev (skills/roster-evidence roster rendered)]
+        (is (= :skill-roster (:type ev)))
+        (is (true? (:truncated ev)))
+        (is (= 60 (count (:entries ev))))
+        (is (some? (:digest ev)))))))
+
+(deftest body-change-under-same-revision-alters-config-digest
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Body v1."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        d1 (:config-digest (skills/load-selected ["demo"] (opts roots)))
+        pairs2 [["SKILL.md" "Body v2."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs2)) pairs2)
+        d2 (:config-digest (skills/load-selected ["demo"] (opts roots)))]
+    (is (not (= d1 d2)))))
+
+(deftest session-records-roster-evidence-and-skills-block
+  (let [roots (make-roots)
+        pairs [["SKILL.md" "Demo procedure."]]
+        _ (write-skill! (:project roots) "demo" (manifest-for "demo" (files-with-digests pairs)) pairs)
+        _ (write-skill! (:project roots) "extra" (manifest-for "extra" (files-with-digests pairs)) pairs)
+        requests (atom [])
+        env (journey-env)
+        profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        session (agent/make-session
+                  {:provider_profile profile :execution_env env :max_subagent_depth 0
+                   :project_docs [] :skills ["demo"]
+                   :project_skills_root (:project roots) :user_skills_root (:user roots)
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (try
+      (is (= "done" (agent/process-input! session "work")))
+      (let [system-text (get-in @requests [0 :messages 0 :content])]
+        (is (str/includes? system-text "<roster>"))
+        (is (str/includes? system-text "extra:"))
+        (is (str/includes? system-text "Demo procedure.")))
+      (let [roster-ev (:skill_roster_evidence @session)]
+        (is (= 2 (count (:entries roster-ev))))
+        (is (false? (:truncated roster-ev))))
+      (finally (agent/close-session! session)))))
+
+(deftest child-skill-options-propagates-selection-and-approvals
+  (let [parent (atom {:config {:skills ["demo"]}
+                      :skill_approvals {"demo" {:winning-root "project"}}
+                      :skill_roots {:project-root "/p" :user-root "/u"}})]
+    (is (= {:skills ["demo"]
+            :skill_approvals {"demo" {:winning-root "project"}}
+            :project_skills_root "/p"
+            :user_skills_root "/u"}
+           (agent/child-skill-options parent))))
+  (let [bare (atom {:config {}})]
+    (is (= {} (agent/child-skill-options bare)))))
+
+(deftest approvals-roundtrip-and-revoke-are-pure
+  (let [entry {"demo" {:winning-root "user"
+                       :project-digest (apply str (repeat 64 "a"))
+                       :user-digest (apply str (repeat 64 "b"))}}
+        dir (fresh-dir "appr-roundtrip")
+        _ (io/mkdir dir)
+        path (str dir "/skill-approvals.edn")]
+    (skills/write-approvals! path entry)
+    (let [access {:read-text (fn [p] (try (io/slurp p) (catch Object _ nil)))
+                  :file-exists (fn [p] (some? (os/stat p)))}]
+      (is (= entry (skills/read-approvals (:read-text access) (:file-exists access) path)))
+      (is (= {} (skills/revoke-approval entry "demo"))))))

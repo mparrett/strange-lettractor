@@ -1,0 +1,597 @@
+(ns attractor.skills
+  "Manifest-based, digest-pinned skill loading (evaluation-harness Slice D).
+
+   Skills are context/procedure packages. They inject prompt text only and
+   grant no tools, namespaces, filesystem paths, secrets, or network
+   endpoints. Selection is explicit: the caller names skill IDs and the
+   loader resolves them against a project root and a user root with
+   deterministic, evidence-recorded precedence.
+
+   Precedence (WP-0 P3 as revised): when the same ID exists in both roots
+   with the same manifest digest, the project copy loads and the agreement
+   is recorded. When the digests differ, loading fails closed with
+   :skill-cross-root-conflict until the caller supplies a sticky approval
+   that names the winning root plus both digests. A same-ID manifest whose
+   :id disagrees with its directory name is a hard :skill-id-mismatch
+   error. Approvals live in user-level config (see default-approvals-path)
+   so repeat runs do not re-prompt; `attractor skills approvals` reviews
+   them and `attractor skills revoke <id>` revokes them."
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]))
+
+(def per-skill-max-bytes
+  "Maximum admitted prompt bytes for one skill (SKILL.md plus references)."
+  8192)
+
+(def total-max-bytes
+  "Maximum admitted prompt bytes across all explicitly selected skills."
+  16384)
+
+(def roster-max-bytes
+  "Maximum bytes for the always-assembled skill roster (id + description)."
+  4096)
+
+(def manifest-file "skill.edn")
+(def body-file "SKILL.md")
+(def approvals-file-name "skill-approvals.edn")
+(def roster-description-max-chars
+  "Maximum characters of one skill description admitted into the roster.
+   Longer descriptions are truncated with a flag so a single entry cannot
+   silently evict the whole index."
+  512)
+(def roster-truncation-marker "[roster truncated to fit budget]")
+
+(defn- fail! [category data]
+  (throw (ex-info (str "Skill: " (name category)) (assoc data :category category))))
+
+(defn- non-blank-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
+(defn- valid-id? [value]
+  (and (string? value) (boolean (re-matches #"[a-z0-9-]+" value))))
+
+(defn- valid-sha256? [value]
+  (and (string? value) (boolean (re-matches #"[0-9a-f]{64}" value))))
+
+(defn- valid-relative-path? [value]
+  (and (non-blank-string? value)
+       (not (str/starts-with? value "/"))
+       (not (str/starts-with? value "\\"))
+       (let [segments (str/split value #"/")]
+         (and (not (some #(contains? #{"" "." ".."} %) segments))
+              (not (some #(str/includes? % "\\") segments))))))
+
+;; ---------------------------------------------------------------------------
+;; Roots and file access.
+;; ---------------------------------------------------------------------------
+
+(defn project-skills-root
+  "Project skill root: a single root at the git top level (falling back to
+   the working directory outside a git checkout) so the loaded set does not
+   depend on cwd depth."
+  [git-root working-dir]
+  (str (or git-root working-dir) "/.attractor/skills"))
+
+(defn user-skills-root
+  "User skill root, honouring $ATTRACTOR_HOME before $HOME. Nil when neither
+   is set, in which case only the project root is consulted."
+  []
+  (let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
+    (when (non-blank-string? base)
+      (str base "/.attractor/skills"))))
+
+(defn default-approvals-path
+  "User-level file holding sticky cross-root approvals. Nil when no home
+   base is configured."
+  []
+  (when-let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
+    (when (non-blank-string? base)
+      (str base "/.attractor/" approvals-file-name))))
+
+(defn local-file-access
+  "Real-filesystem accessors for the CLI and for tests that use temp dirs."
+  []
+  {:read-text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+   :file-exists (fn [path] (some? (os/stat path)))
+   :list-dir (fn [path]
+               (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                              (os/ls path)))
+                    (catch Object _ [])))})
+
+(defn env-file-access
+  "Adapt an agent execution environment to loader accessors. :list-dir is
+   nil when the environment cannot list directories; discovery then yields
+   an empty roster but explicit selection still works."
+  [environment]
+  {:read-text (or (:read_text environment)
+                  (when-let [read-file (:read_file environment)]
+                    (fn [path] (try (read-file path nil nil) (catch Object _ nil)))))
+   :file-exists (:file_exists environment)
+   :list-dir (when-let [list-directory (:list_directory environment)]
+               (fn [path]
+                 (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                                (list-directory path 1)))
+                      (catch Object _ []))))})
+
+;; ---------------------------------------------------------------------------
+;; Manifest schema (data-only).
+;; ---------------------------------------------------------------------------
+
+(defn- validate-file-entry! [entry id]
+  (when-not (and (map? entry)
+                 (valid-relative-path? (:path entry))
+                 (valid-sha256? (:sha256 entry)))
+    (fail! :skill-manifest-invalid {:skill_id id :reason :invalid-file-entry}))
+  entry)
+
+(defn- validate-manifest! [manifest id]
+  (when-not (map? manifest)
+    (fail! :skill-manifest-invalid {:skill_id id :reason :manifest-not-a-map}))
+  (when-not (= id (:id manifest))
+    (fail! :skill-id-mismatch {:skill_id id :manifest_id (:id manifest)}))
+  (when-not (valid-id? (:id manifest))
+    (fail! :skill-manifest-invalid {:skill_id id :reason :invalid-id}))
+  (doseq [key [:revision :name :description]]
+    (let [value (get manifest key)]
+      (when-not (or (non-blank-string? value) (and (= key :revision) (integer? value)))
+        (fail! :skill-manifest-invalid {:skill_id id :reason (keyword (str "invalid-" (name key)))}))))
+  (let [files (:files manifest)]
+    (when-not (and (vector? files) (seq files))
+      (fail! :skill-manifest-invalid {:skill_id id :reason :files-must-be-non-empty}))
+    (let [entries (mapv #(validate-file-entry! % id) files)
+          paths (mapv :path entries)]
+      (when-not (= (count paths) (count (distinct paths)))
+        (fail! :skill-manifest-invalid {:skill_id id :reason :duplicate-file-path}))
+      (when-not (some #(= body-file %) paths)
+        (fail! :skill-manifest-invalid {:skill_id id :reason :missing-body-file}))
+      (when-let [signature (:signature manifest)]
+        (when-not (map? signature)
+          (fail! :skill-manifest-invalid {:skill_id id :reason :invalid-signature})))
+      entries)))
+
+(defn- parse-manifest! [text id manifest-path]
+  "Parse and validate the manifest. Returns {:manifest :entries}; the
+   entries come from the single validation pass."
+  (let [manifest (try (edn/read-string text)
+                      (catch Object _
+                        (fail! :skill-manifest-invalid {:skill_id id :reason :manifest-not-edn
+                                                       :path manifest-path})))]
+    {:manifest manifest :entries (validate-manifest! manifest id)}))
+
+(defn- read-or-nil [read-text path]
+  (when read-text
+    (try (read-text path) (catch Object _ nil))))
+
+(defn- manifest-info
+  "Light manifest read: digest plus validated manifest, without bodies.
+   Returns nil when the root holds no manifest for id. Fails closed when
+   the manifest is present but invalid or unreadable."
+  [root id read-text file-exists]
+  (when (non-blank-string? root)
+    (let [manifest-path (str root "/" id "/" manifest-file)]
+      (if (and file-exists
+               (try (not (file-exists manifest-path)) (catch Object _ false)))
+        nil
+        (let [text (read-or-nil read-text manifest-path)]
+          (when (nil? text)
+            (fail! :skill-manifest-invalid {:skill_id id :reason :manifest-unreadable
+                                           :path manifest-path}))
+          (let [{:keys [manifest]} (parse-manifest! text id manifest-path)]
+            {:manifest-digest (hash/sha256 text)
+             :revision (str (:revision manifest))
+             :description (:description manifest)}))))))
+
+;; ---------------------------------------------------------------------------
+;; Loading from one root.
+;; ---------------------------------------------------------------------------
+
+
+(defn- present? [file-exists path]
+  (try (boolean (when file-exists (file-exists path)))
+       (catch Object _ true)))
+
+(defn- assemble-body
+  "Assemble the prompt body: SKILL.md verbatim, references with headers."
+  [file-contents]
+  (str/join "\n\n"
+            (map (fn [{:keys [path content]}]
+                   (if (= body-file path)
+                     content
+                     (str "# " path "\n" content)))
+                 file-contents)))
+(defn- read-listed-files
+  "Read and digest-verify every manifest-listed file. Missing or
+   unreadable files fail closed with distinct reasons."
+  [root id entries read-text file-exists]
+  (mapv (fn [{:keys [path sha256]}]
+          (let [file-path (str root "/" id "/" path)
+                content (read-or-nil read-text file-path)]
+            (when (nil? content)
+              (if (present? file-exists file-path)
+                (fail! :skill-manifest-invalid {:skill_id id :reason :listed-file-unreadable
+                                               :path path})
+                (fail! :skill-manifest-invalid {:skill_id id :reason :listed-file-missing
+                                               :path path})))
+            (when-not (= sha256 (hash/sha256 content))
+              (fail! :skill-digest-mismatch {:skill_id id :path path
+                                            :expected sha256}))
+            {:path path :content content}))
+        entries))
+
+(defn- read-loaded-root
+  "Read, verify, and assemble a present skill manifest and its files."
+  [root root-name id manifest-path read-text file-exists]
+  (let [text (read-or-nil read-text manifest-path)]
+    (when (nil? text)
+      (fail! :skill-manifest-invalid {:skill_id id :reason :manifest-unreadable
+                                     :path manifest-path}))
+    (let [manifest-digest (hash/sha256 text)
+          {:keys [manifest entries]} (parse-manifest! text id manifest-path)
+          file-contents (read-listed-files root id entries read-text file-exists)
+          body (assemble-body file-contents)
+          byte-count (count (bytes body))]
+      (when (> byte-count per-skill-max-bytes)
+        (fail! :skill-budget-exceeded {:skill_id id :bytes byte-count
+                                      :limit per-skill-max-bytes}))
+      {:id id
+       :revision (str (:revision manifest))
+       :description (:description manifest)
+       :root root-name
+       :manifest-digest manifest-digest
+       :file-digests (mapv (fn [{:keys [path sha256]}] {:path path :sha256 sha256}) entries)
+       :body body
+       :bytes byte-count})))
+
+(defn- load-from-root
+  "Load and verify the skill id from one root. Returns nil when the root
+   has no manifest for id; otherwise returns the loaded skill or throws.
+   Absence (no manifest) yields nil, but an unreadable manifest or listed
+   file fails closed: IO faults must not degrade into silent sole-root or
+   not-found outcomes."
+  [root root-name id read-text file-exists]
+  (when (non-blank-string? root)
+    (let [manifest-path (str root "/" id "/" manifest-file)]
+      (when (present? file-exists manifest-path)
+        (read-loaded-root root root-name id manifest-path read-text file-exists)))))
+
+(defn- approval-matches? [approval project-loaded user-loaded]
+  (and (map? approval)
+       (contains? #{"project" "user"} (:winning-root approval))
+       (= (:project-digest approval) (:manifest-digest project-loaded))
+       (= (:user-digest approval) (:manifest-digest user-loaded))))
+
+(defn- resolve-one [id roots read-text file-exists approvals]
+  (let [{:keys [project-root user-root]} roots
+        project-loaded (load-from-root project-root "project" id read-text file-exists)
+        user-loaded (load-from-root user-root "user" id read-text file-exists)]
+    (cond
+      (and (nil? project-loaded) (nil? user-loaded))
+      (fail! :skill-not-found {:skill_id id})
+
+      (nil? user-loaded)
+      {:loaded (assoc project-loaded :cross-root :sole-project) :agreed false :approval nil}
+
+      (nil? project-loaded)
+      {:loaded (assoc user-loaded :cross-root :sole-user) :agreed false :approval nil}
+
+      (= (:manifest-digest project-loaded) (:manifest-digest user-loaded))
+      {:loaded (assoc project-loaded :cross-root :agree) :agreed true :approval nil}
+
+      :else
+      (let [approval (get approvals id)]
+        (if (approval-matches? approval project-loaded user-loaded)
+          {:loaded (assoc (if (= "user" (:winning-root approval)) user-loaded project-loaded)
+                          :cross-root :approved
+                          :loser-digest (:manifest-digest
+                                         (if (= "user" (:winning-root approval))
+                                           project-loaded user-loaded)))
+           :agreed false :approval {id approval}}
+          (fail! :skill-cross-root-conflict
+                 {:skill_id id
+                  :project-digest (:manifest-digest project-loaded)
+                  :user-digest (:manifest-digest user-loaded)
+                  :hint "Record a sticky approval for this id naming winning-root plus both digests."}))))))
+
+(defn skills-config-digest
+  "Stable digest over the sorted [id revision manifest-digest] triples of
+   the loaded skills. Identical selections compare equal; any revision
+   change alters the digest. Bodies are covered by their digests."
+  [loaded]
+  (hash/sha256
+    (pr-str (sort-by first (mapv (fn [skill] [(:id skill) (str (:revision skill))
+                                              (:manifest-digest skill)])
+                                 loaded)))))
+
+(defn render-skill-element
+  "Render one loaded skill as its <skill> prompt element."
+  [skill]
+  (str "<skill id=\"" (:id skill)
+       "\" revision=\"" (str (:revision skill))
+       "\" digest=\"" (:manifest-digest skill) "\">\n"
+       (:body skill)
+       "\n</skill>"))
+
+(defn load-selected
+  "Explicitly load skill ids. opts needs :project-root, :user-root,
+   :read-text, :file-exists, and :approvals (map id -> {:winning-root
+   \"project\"|\"user\" :project-digest :user-digest}).
+
+   Selected ids must match the skill id grammar before any filesystem
+   read, so traversal segments (dot-dot, slash, uppercase) fail closed
+   with :skill-selection-invalid instead of probing outside the roots.
+
+   Returns {:loaded [...] :evidence [...] :config-digest ...}. Every
+   failure is fail-closed with a :skill-* category."
+  [ids opts]
+  (let [{:keys [project-root user-root read-text file-exists approvals]} opts]
+    (when-not (and (vector? ids) (seq ids) (every? non-blank-string? ids))
+      (fail! :skill-selection-invalid {:reason :ids-must-be-non-empty-strings}))
+    (when-not (every? valid-id? ids)
+      (fail! :skill-selection-invalid {:reason :ids-must-match-skill-id-grammar
+                                      :skill_ids (vec (remove valid-id? ids))}))
+    (when (nil? read-text)
+      (fail! :skill-configuration {:reason :no-read-text-accessor}))
+    (when (nil? file-exists)
+      (fail! :skill-configuration {:reason :no-file-exists-accessor}))
+    (when-not (= (count ids) (count (distinct ids)))
+      (fail! :skill-selection-invalid {:reason :duplicate-selected-id}))
+    (let [resolved (mapv #(resolve-one % {:project-root project-root :user-root user-root}
+                                       read-text file-exists (or approvals {}))
+                         ids)
+          loaded (mapv :loaded resolved)
+          total (reduce + 0 (map #(count (bytes (render-skill-element %))) loaded))]
+      (when (> total total-max-bytes)
+        (fail! :skill-budget-exceeded {:skill_ids ids :bytes total :limit total-max-bytes}))
+      (let [config-digest (skills-config-digest loaded)]
+        {:loaded loaded
+         :evidence (mapv (fn [skill resolution]
+                           {:type :skill-loaded
+                            :skill_id (:id skill)
+                            :revision (:revision skill)
+                            :manifest-digest (:manifest-digest skill)
+                            :file-digests (:file-digests skill)
+                            :root (:root skill)
+                            :cross-root (:cross-root skill)
+                            :loser-digest (:loser-digest skill)
+                            :bytes (:bytes skill)
+                            :truncated false
+                            :approvals-used (:approval resolution)})
+                         loaded resolved)
+         :config-digest config-digest}))))
+
+;; ---------------------------------------------------------------------------
+;; Discovery (static roster) and prompt rendering.
+;; ---------------------------------------------------------------------------
+
+(defn- cap-description [description]
+  "Cap one roster description so a single entry cannot evict the index.
+   Returns [text truncated?]."
+  (let [text (str description)]
+    (if (<= (count text) roster-description-max-chars)
+      [text false]
+      [(str (subs text 0 roster-description-max-chars)
+            "...[description truncated]")
+       true])))
+
+(defn discover
+  "Best-effort roster of available skills across both roots. Each entry
+   carries {:id :revision :description :description-truncated :root
+   :cross-root :manifest-digest}. :cross-root is :sole-project, :sole-user,
+   :agree, or :divergent; project wins the roster slot on duplicates.
+   Descriptions are an untrusted index only: bodies still require explicit
+   digest-pinned selection. Entries that fail to parse are skipped here;
+   explicit selection still fails loudly on them."
+  [opts]
+  (let [{:keys [project-root user-root read-text list-dir]} opts]
+    (if (nil? list-dir)
+      []
+      (let [entries-for
+            (fn [root root-name]
+              (if (or (nil? root) (str/blank? root))
+                []
+                (mapv (fn [id] {:id id :root root :root-name root-name})
+                      (sort (filter valid-id? (or (list-dir root) []))))))
+            describe
+            (fn [{:keys [id root root-name]}]
+              (try
+                (let [text (read-or-nil read-text (str root "/" id "/" manifest-file))]
+                  (when (some? text)
+                    (let [manifest (edn/read-string text)]
+                      (when (and (map? manifest)
+                                 (= id (:id manifest))
+                                 (non-blank-string? (:description manifest)))
+                        (let [[capped truncated?] (cap-description (:description manifest))]
+                          {:id id
+                           :revision (str (:revision manifest))
+                           :description capped
+                           :description-truncated truncated?
+                           :manifest-digest (hash/sha256 text)
+                           :root root-name})))))
+                (catch Object _ nil)))
+            project-described (vec (keep describe (entries-for project-root "project")))
+            project-by-id (into {} (map (fn [entry] [(:id entry) entry]) project-described))
+            user-described (vec (keep describe (entries-for user-root "user")))]
+        (vec (concat (mapv (fn [entry]
+                             (let [user-entry (some #(when (= (:id entry) (:id %)) %) user-described)]
+                               (assoc entry :cross-root
+                                      (if (nil? user-entry)
+                                        :sole-project
+                                        (if (= (:manifest-digest entry)
+                                               (:manifest-digest user-entry))
+                                          :agree
+                                          :divergent)))))
+                           project-described)
+                     (mapv #(assoc % :cross-root :sole-user)
+                           (remove #(contains? project-by-id (:id %)) user-described))))))))
+
+(defn- roster-lines [roster]
+  (mapv (fn [{:keys [id description]}] (str id ": " description)) roster))
+
+(defn render-roster
+  "Render the id + description index, keeping whole lines within budget.
+   Returns {:text :truncated :omitted}. Dropped lines are reported with an
+   explicit marker instead of silent truncation."
+  [roster]
+  (let [lines (roster-lines roster)
+        marker-bytes (count (bytes roster-truncation-marker))]
+    (loop [remaining lines kept [] used 0]
+      (if (empty? remaining)
+        {:text (str/join "\n" kept) :truncated false :omitted 0}
+        (let [line (first remaining)
+              cost (+ (if (seq kept) 1 0) (count (bytes line)))
+              tail (rest remaining)]
+          (if (> (+ used cost) roster-max-bytes)
+            (let [omitted (inc (count tail))
+                  suffix (str "\n" roster-truncation-marker
+                              " (" omitted " omitted)")
+                  suffix-bytes (count (bytes suffix))
+                  trimmed (loop [k kept u used]
+                            (if (or (empty? k) (<= (+ u suffix-bytes) roster-max-bytes))
+                              k
+                              (let [dropped (peek k)
+                                    freed (+ (count (bytes dropped))
+                                             (if (> (count k) 1) 1 0))]
+                                (recur (pop k) (- u freed)))))]
+              {:text (str (str/join "\n" trimmed) suffix)
+               :truncated true :omitted omitted})
+            (recur tail (conj kept line) (+ used cost))))))))
+
+(defn roster-evidence
+  "Evidence for the assembled roster: per-entry digests and roots plus
+   the render truncation flag. Bodies still require explicit selection."
+  [roster roster-render]
+  {:type :skill-roster
+   :entries (mapv (fn [entry]
+                    {:skill_id (:id entry)
+                     :revision (:revision entry)
+                     :root (:root entry)
+                     :cross-root (:cross-root entry)
+                     :manifest-digest (:manifest-digest entry)
+                     :description-truncated (:description-truncated entry)})
+                  roster)
+   :truncated (:truncated roster-render)
+   :omitted (:omitted roster-render)
+   :digest (hash/sha256
+             (pr-str (sort-by first
+                              (mapv (fn [entry] [(:id entry) (str (:revision entry))
+                                                 (:manifest-digest entry)])
+                                    roster))))})
+
+(defn render-skills-block
+  "Render the <skills> prompt block: always the roster, plus bodies for
+   explicitly loaded skills. Nil when there is nothing to render. Skills
+   contribute context/procedure text only; nothing here registers tools."
+  [{:keys [roster loaded]}]
+  (let [roster (or roster []) loaded (or loaded [])]
+    (when (or (seq roster) (seq loaded))
+      (let [parts (cond-> []
+                    (seq roster) (conj (str "<roster>\n" (:text (render-roster roster)) "\n</roster>"))
+                    (seq loaded) (into (mapv render-skill-element loaded)))]
+        (str "<skills>\n" (str/join "\n" parts) "\n</skills>")))))
+
+;; ---------------------------------------------------------------------------
+;; Sticky approvals (user-level config).
+;; ---------------------------------------------------------------------------
+
+(defn- validate-approval! [id approval path]
+  (when-not (and (map? approval)
+                 (contains? #{"project" "user"} (:winning-root approval))
+                 (valid-sha256? (:project-digest approval))
+                 (valid-sha256? (:user-digest approval)))
+    (fail! :skill-approvals-invalid {:path path :skill_id id
+                                    :reason :invalid-approval-entry}))
+  (when-not (valid-id? id)
+    (fail! :skill-approvals-invalid {:path path :skill_id id
+                                    :reason :invalid-skill-id}))
+  approval)
+
+(defn read-approvals
+  "Read the sticky approvals map from path. Missing file yields {}.
+   Present-but-invalid content fails closed, including malformed
+   per-skill entries."
+  [read-text file-exists path]
+  (if (or (nil? path) (false? (when file-exists
+                                (try (file-exists path) (catch Object _ false)))))
+    {}
+    (let [text (read-or-nil read-text path)]
+      (if (nil? text)
+        {}
+        (let [data (try (edn/read-string text)
+                        (catch Object _
+                          (fail! :skill-approvals-invalid {:path path})))]
+          (when-not (map? data)
+            (fail! :skill-approvals-invalid {:path path :reason :not-a-map}))
+          (into {} (map (fn [[id approval]]
+                          [id (validate-approval! id approval path)])
+                        data)))))))
+
+(defn propose-approval
+  "Build the sticky approval entry for a cross-root-divergent skill id,
+   reading both roots' manifest digests. The caller persists the returned
+   {id entry} map (merged into existing approvals). Fails closed when the
+   id is absent from a root (:skill-not-found), when a single root holds
+   it or both digests agree (:skill-approval-unneeded), or when the winner
+   is not \"project\"/\"user\" (:skill-selection-invalid)."
+  [opts id winner]
+  (when-not (valid-id? id)
+    (fail! :skill-selection-invalid {:reason :ids-must-match-skill-id-grammar
+                                    :skill_ids [id]}))
+  (when-not (contains? #{"project" "user"} winner)
+    (fail! :skill-selection-invalid {:reason :winner-must-be-project-or-user
+                                    :skill_id id}))
+  (let [{:keys [project-root user-root read-text file-exists]} opts
+        _ (when (or (nil? read-text) (nil? file-exists))
+            (fail! :skill-configuration {:reason :no-file-accessors}))
+        project-info (manifest-info project-root id read-text file-exists)
+        user-info (manifest-info user-root id read-text file-exists)]
+    (cond
+      (and (nil? project-info) (nil? user-info))
+      (fail! :skill-not-found {:skill_id id})
+
+      (or (nil? project-info) (nil? user-info)
+          (= (:manifest-digest project-info) (:manifest-digest user-info)))
+      (fail! :skill-approval-unneeded {:skill_id id})
+
+      :else
+      {id {:winning-root winner
+           :project-digest (:manifest-digest project-info)
+           :user-digest (:manifest-digest user-info)}})))
+
+(defn read-default-approvals
+  "Read approvals from the default user-level path using accessors that
+   expose :read-text and :file-exists."
+  [access]
+  (read-approvals (:read-text access) (:file-exists access) (default-approvals-path)))
+
+(defn write-approvals!
+  "Persist the approvals map to path (EDN)."
+  [path approvals]
+  (io/spit path (pr-str approvals))
+  approvals)
+
+(defn revoke-approval
+  "Pure revoke: drop id from the approvals map."
+  [approvals id]
+  (dissoc approvals id))
+
+(defn short-digest
+  "First 7 hex chars for display; passes through short/missing values."
+  [digest]
+  (let [text (str digest)]
+    (subs text 0 (min 7 (count text)))))
+
+(defn format-roster-table
+  "Pure CLI rendering of discovered skills with manifest digests."
+  [discovered]
+  (if (empty? discovered)
+    "(no skills discovered)"
+    (str/join "\n"
+              (mapv (fn [{:keys [id revision description root cross-root manifest-digest]}]
+                      (str "  " id " @ " revision " [" root
+                           (when cross-root (str "/" (name cross-root)))
+                           "]  digest " (or manifest-digest "(unverified)")
+                           "\n    " description))
+                    discovered))))
