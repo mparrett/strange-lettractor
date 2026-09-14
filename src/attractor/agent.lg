@@ -1,5 +1,5 @@
 (ns attractor.agent
-  (:require [attractor.ids :as ids] [attractor.skills :as skills] [clojure.string :as str]
+  (:require [attractor.ids :as ids] [attractor.mcp :as mcp] [attractor.skills :as skills] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
@@ -455,12 +455,22 @@
           snapshot (environment-snapshot environment profile)
           selected-skills (vec (or (:skills options) []))
           skill-access (skills/env-file-access environment)
+          repo-git-root (environment-command environment "git rev-parse --show-toplevel")
+          repo-working-dir ((:working_directory environment))
           skill-roots {:project-root (or (:project_skills_root options)
                                          (skills/project-skills-root
-                                           (environment-command environment "git rev-parse --show-toplevel")
-                                           ((:working_directory environment))))
+                                           repo-git-root repo-working-dir))
                        :user-root (or (:user_skills_root options)
                                       (skills/user-skills-root))}
+          selected-mcp (vec (or (:mcp options) []))
+          mcp-roots {:project-root (or (:project_mcp_root options)
+                                       (mcp/project-mcp-root
+                                         repo-git-root repo-working-dir))
+                     :user-root (or (:user_mcp_root options)
+                                    (mcp/user-mcp-root))}
+          mcp-approvals (if (contains? options :mcp_approvals)
+                          (or (:mcp_approvals options) {})
+                          (mcp/read-default-approvals skill-access))
           skill-approvals (if (contains? options :skill_approvals)
                             (or (:skill_approvals options) {})
                             (skills/read-default-approvals skill-access))
@@ -538,6 +548,18 @@
                               :skills (:skill_evidence @session)
                               :roster (:skill_roster_evidence @session)
                               :config_digest (:skills_config_digest @session)}))
+      (when (seq selected-mcp)
+        (let [admission (mcp/admit-servers!
+                          session selected-mcp
+                          (assoc mcp-roots
+                                 :read-text (:read-text skill-access)
+                                 :file-exists (:file-exists skill-access)
+                                 :list-dir (:list-dir skill-access)
+                                 :approvals mcp-approvals
+                                 :token-reader (fn [name] (os/getenv name))))]
+          (emit-event! session {:type :mcp_admitted
+                                :servers (:servers admission)
+                                :config_digest (:config-digest admission)})))
       (emit-event! session {:type :session_start})
       session)))
 
@@ -592,6 +614,10 @@
         (doseq [[agent-id _] (:subagents @session)]
           (try
             (close-subagent! session agent-id)
+            (catch Object e (swap! errors conj e))))
+        (doseq [close-mcp (:mcp_close_fns @session)]
+          (try
+            (close-mcp)
             (catch Object e (swap! errors conj e))))
         (finally
           (when (seq @errors)

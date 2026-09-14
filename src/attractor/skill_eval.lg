@@ -83,6 +83,10 @@
       (fail! :skill-eval-corpus-invalid {:task_id id :reason :relevant-skills-must-be-string-vector}))
     (when (nil? (split-value (:split task)))
       (fail! :skill-eval-corpus-invalid {:task_id id :reason :split-must-be-anchor-or-holdout}))
+    (when (contains? task :mcp-gate-inputs)
+      (when-not (and (vector? (:mcp-gate-inputs task))
+                     (every? non-blank-string? (:mcp-gate-inputs task)))
+        (fail! :skill-eval-corpus-invalid {:task_id id :reason :mcp-gate-inputs-must-be-string-vector})))
     (validate-gates! (:hard-gates task) id)
     id))
 
@@ -131,13 +135,26 @@
       :max-tool-calls {:gate gate :pass (<= tool-count value)
                        :detail (str tool-count " <= " value)})))
 
+(defn strip-mcp-blocks
+  "Remove labeled <mcp provenance=\"externally-supplied\"> evidence blocks
+   from text. Read-only MCP calls are not permitted in deterministic hard
+   gates (default deny): gates evaluate the remaining session text only.
+   The match is anchored on the emitted provenance attribute, so bare
+   <mcp> lookalikes stay visible to gates. A task may still name
+   :mcp-gate-inputs for provenance recording; matching stays stripped in
+   this slice."
+  [text]
+  (str/replace (str text) #"(?s)<mcp [^>]*provenance=\"externally-supplied\"[^>]*>.*?</mcp>" ""))
+
 (defn evaluate-gates
   "Evaluate data gates over a session summary
-   {:final-text :tool-names :tool-call-count}. Unknown gate keys are
+   {:final-text :tool-names :tool-call-count}. MCP evidence blocks are
+   stripped from the text first (default deny). Unknown gate keys are
    ignored here (validate-corpus! rejects them for corpora). Returns
    {:pass :details} in fixed gate order."
   [gates summary]
-  (let [details (vec (keep (fn [gate]
+  (let [summary (assoc summary :final-text (strip-mcp-blocks (:final-text summary)))
+        details (vec (keep (fn [gate]
                              (when (contains? gates gate)
                                (check-one-gate gate (get gates gate) summary)))
                            gate-keys))]
@@ -201,7 +218,8 @@
 
 (defn- run-custom-gate [gate summary]
   (try
-    (let [outcome ((:fn gate) summary)]
+    (let [stripped (assoc summary :final-text (strip-mcp-blocks (:final-text summary)))
+          outcome ((:fn gate) stripped)]
       (if (map? outcome)
         {:gate :custom :id (:id gate) :pass (boolean (:pass outcome))
          :detail (str (:detail outcome))}
@@ -256,6 +274,7 @@
     {:task-id (:id task)
      :split (split-value (:split task))
      :selection (vec selection)
+     :mcp-gate-inputs (vec (or (:mcp-gate-inputs task) []))
      :status (:status outcome)
      :error (:error outcome)
      :success success

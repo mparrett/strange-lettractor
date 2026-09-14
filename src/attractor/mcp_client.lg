@@ -1,0 +1,206 @@
+(ns attractor.mcp-client
+  "Minimal MCP Streamable HTTP client (Slice E, WP-3 follow-up scope).
+
+   Modern-first per the current spec revision: stateless single-POST calls
+   with per-request SSE streams, no protocol sessions, no session headers.
+   On HTTP 400 the body decides: a recognized modern JSON-RPC error means
+   the request itself is wrong (stay modern, report it); an empty or
+   unrecognized body means a legacy-era server, and the client falls back
+   to the initialize handshake plus Mcp-Session-Id session behavior
+   (required by legacy pilots that advertise Mcp-Session-Id).
+
+   Transport is an injectable fn shaped like http/request: it takes
+   {:method :url :headers :body} and returns {:status :headers :body}.
+   The default transport is http/request itself. Calls are bounded by
+   timeout plus an optional abort poll through capacity/call!, whose worker
+   errors stay redacted. Empty or malformed successes fail closed; a
+   transport-level throw means :mcp-unavailable, never empty data."
+  (:require [attractor.context-discovery :as capacity]
+            [attractor.llm :as llm]
+            [clojure.string :as str]
+            [http :as http]
+            [json :as json]))
+
+(def default-timeout-ms 10000)
+(def modern-protocol-version "2026-07-28")
+
+(defn- fail! [category data]
+  (throw (ex-info (str "MCP: " (name category)) (assoc data :category category))))
+
+(defn- header-value [headers name]
+  (let [wanted (str/lower-case (str name))]
+    (some (fn [[key value]]
+            (when (= wanted (str/lower-case (str key)))
+              value))
+          headers)))
+
+(defn- rpc-envelope [method params id notify?]
+  (cond-> {:jsonrpc "2.0" :method method}
+    (some? params) (assoc :params params)
+    (not notify?) (assoc :id id)))
+
+(defn- parse-rpc-text [text]
+  (let [message (try (json/read-json (str text))
+                     (catch Object _
+                       (fail! :mcp-protocol-error {:reason :malformed-json})))]
+    (when-not (map? message)
+      (fail! :mcp-protocol-error {:reason :rpc-not-an-object}))
+    (cond (contains? message "result") {:ok true :result (get message "result")
+                                        :id (get message "id")}
+          (contains? message "error") {:ok false :error (get message "error")
+                                       :id (get message "id")}
+          :else (fail! :mcp-protocol-error {:reason :rpc-neither-result-nor-error}))))
+
+(defn- sse-payload-text [body]
+  (let [events (llm/parse-sse-lines (str/split (str body) #"\r?\n"))
+        chunks (vec (remove str/blank? (map :data events)))]
+    (when (empty? chunks)
+      (fail! :mcp-protocol-error {:reason :empty-sse-stream}))
+    (str/join "\n" chunks)))
+
+(defn- decode-body [headers body]
+  (let [content-type (str/lower-case (str (or (header-value headers "content-type") "")))]
+    (if (str/includes? content-type "text/event-stream")
+      (parse-rpc-text (sse-payload-text body))
+      (parse-rpc-text body))))
+
+(defn- bounded-post [handle url headers body-text]
+  (let [transport (or (:transport @handle) http/request)
+        outcome (capacity/call!
+                  (fn [] (transport {:method :post :url url
+                                     :headers headers :body body-text}))
+                  {:timeout_ms (or (:timeout-ms @handle) default-timeout-ms)
+                   :aborted? (:aborted? @handle)})]
+    (if (and (map? outcome) (= :unavailable (:status outcome)))
+      (fail! (case (:reason outcome)
+               :timeout :mcp-timeout
+               :abort :mcp-cancelled
+               :mcp-unavailable)
+             {:url url})
+      outcome)))
+
+(defn- check-rpc-id [parsed request-id]
+  (when-not (= request-id (:id parsed))
+    (fail! :mcp-protocol-error {:reason :rpc-id-mismatch
+                               :request request-id :response (:id parsed)}))
+  parsed)
+
+(defn- post-request [handle method params]
+  (let [state @handle
+        request-id (swap! (:next-id state) inc)
+        body-text (json/write-json (rpc-envelope method params request-id false))
+        headers (cond-> (merge {"content-type" "application/json"
+                                  "accept" "application/json, text/event-stream"}
+                                 (:headers state))
+                  (some? (:session-id state))
+                  (assoc "mcp-session-id" (:session-id state)))
+        response (bounded-post handle (:endpoint state) headers body-text)
+        status (:status response)
+        body (or (:body response) "")]
+    (cond (= 401 status)
+          (fail! :mcp-auth-failed {:url (:endpoint state)})
+
+          (= 400 status)
+          (let [parsed (try (json/read-json (str body)) (catch Object _ nil))]
+            (if (and (map? parsed) (map? (get parsed "error")))
+              (fail! :mcp-request-error {:code (get-in parsed ["error" "code"])
+                                        :message (get-in parsed ["error" "message"])})
+              (fail! :mcp-legacy-fallback-required {:url (:endpoint state)})))
+
+          (contains? #{200 201} status)
+          (let [parsed (check-rpc-id (decode-body (:headers response) body) request-id)]
+            (if (:ok parsed)
+              {:result (:result parsed)}
+              (fail! :mcp-remote-error {:code (get-in parsed [:error "code"])
+                                       :message (get-in parsed [:error "message"])})))
+
+          :else
+          (fail! :mcp-transport-error {:url (:endpoint state) :status status}))))
+
+(defn- post-notification [handle method params]
+  (let [state @handle
+        body-text (json/write-json (rpc-envelope method params nil true))
+        headers (cond-> (merge {"content-type" "application/json"
+                                  "accept" "application/json, text/event-stream"}
+                                 (:headers state))
+                  (some? (:session-id state))
+                  (assoc "mcp-session-id" (:session-id state)))]
+    (bounded-post handle (:endpoint state) headers body-text)
+    nil))
+
+(defn open-session
+  "Open a client handle (an atom). Modern mode needs no handshake: the
+   handle starts stateless and upgrades to legacy on first fallback.
+   opts: :transport, :endpoint (required), :timeout-ms, :aborted?,
+   :headers (merged into every request, used for authorization)."
+  [opts]
+  (let [{:keys [transport endpoint timeout-ms aborted? headers]} (or opts {})]
+    (when (str/blank? (str endpoint))
+      (fail! :mcp-configuration {:reason :endpoint-required}))
+    (atom {:transport transport :endpoint endpoint
+           :timeout-ms (or timeout-ms default-timeout-ms)
+           :aborted? aborted?
+           :headers (or headers {})
+           :mode :modern :session-id nil
+           :next-id (atom 0)})))
+
+(defn set-headers!
+  "Replace the extra headers merged into every request (used for token
+   refresh without rebuilding the handle)."
+  [handle headers]
+  (swap! handle assoc :headers (or headers {}))
+  nil)
+
+(defn- do-handshake! [handle]
+  "Legacy initialize handshake. Captures the session id, marks the
+   handle legacy, and sends notifications/initialized."
+  (let [state @handle
+        request-id (swap! (:next-id state) inc)
+        body-text (json/write-json (rpc-envelope "initialize"
+                                                 {:protocolVersion modern-protocol-version
+                                                  :capabilities {}
+                                                  :clientInfo {:name "attractor" :version "0"}}
+                                                 request-id false))
+        headers (merge {"content-type" "application/json"
+                         "accept" "application/json, text/event-stream"}
+                        (:headers state))
+        response (bounded-post handle (:endpoint state) headers body-text)
+        session-id (header-value (:headers response) "mcp-session-id")]
+    (when (str/blank? (str session-id))
+      (fail! :mcp-protocol-error {:reason :legacy-handshake-without-session-id}))
+    (swap! handle assoc :mode :legacy :session-id session-id)
+    (post-notification handle "notifications/initialized" {})
+    session-id))
+
+(defn session-request!
+  "POST one JSON-RPC method and return {:result :mode}. Modern-first with
+   automatic legacy fallback: when the endpoint answers 400 with an empty
+   or unrecognized body, the handle handshakes once and retries with the
+   legacy session id. Modern JSON-RPC errors never trigger the fallback."
+  [handle method params]
+  (try
+    (assoc (post-request handle method params) :mode (:mode @handle))
+    (catch Object error
+      (when-not (= :mcp-legacy-fallback-required (:category (ex-data error)))
+        (throw error))
+      (when (= :legacy (:mode @handle))
+        (fail! :mcp-transport-error {:url (:endpoint @handle)
+                                    :reason :legacy-retry-rejected}))
+      (do-handshake! handle)
+      (assoc (post-request handle method params) :mode (:mode @handle)))))
+
+(defn close-session!
+  "Best-effort teardown. Legacy handles issue DELETE with the session id;
+   modern handles hold no server state, so closing is a local no-op.
+   Teardown failures are swallowed: server-side expiry is the backstop."
+  [handle]
+  (let [state (when (some? handle) @handle)]
+    (when (and (= :legacy (:mode state)) (not (str/blank? (str (:session-id state)))))
+      (try
+        (let [transport (or (:transport state) http/request)]
+          (transport {:method :delete :url (:endpoint state)
+                      :headers (assoc (:headers state)
+                                      "mcp-session-id" (:session-id state))
+                      :body ""}))
+        (catch Object _ nil))))
+  nil)

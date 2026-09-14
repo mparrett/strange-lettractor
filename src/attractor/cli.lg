@@ -25,6 +25,7 @@
             [attractor.ids :as ids]
             [attractor.providers :as providers]
             [attractor.skills :as skills]
+            [attractor.mcp :as mcp]
             [attractor.skill-eval :as skill-eval]
             [clojure.core :as core]
             [clojure.edn :as edn]))
@@ -373,6 +374,7 @@
   (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
   (println "  providers                                           Show the effective provider registry (attractor.edn)")
   (println "  skills [approvals|approve <id> --winner r|revoke <id>]  List skills; review, approve, or revoke approvals")
+  (println "  mcp [servers|authorize <id>|register <id>]         List MCP servers; authorize or register")
   (println (str "  agent <" (str/join "|" (registry/agent-names)) "> --prompt-file <file>          Run one external agent job, EDN events"))
   (println "    [--cwd <dir>] [--model <m>] [--timeout-ms <ms>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--sandbox read-only|workspace-write|danger-full-access] [--approval-policy never|on-request|untrusted]")
@@ -766,6 +768,83 @@
                 (do (println "Usage: attractor skills [approvals|approve <skill-id> --winner project|user|revoke <skill-id>|eval-report <file>|promote --report <file> --skill <id> --approver <n> --statement <t> --out <file>]")
                     (os/exit 1))))))))))
 
+(defn- cli-mcp-roots []
+  (let [access (skills/local-file-access)
+        top (try
+              (let [result (os/sh "/bin/bash" "-c" "git rev-parse --show-toplevel")]
+                (when (= 0 (:exit result))
+                  (let [trimmed (str/trim (or (:out result) ""))]
+                    (when-not (str/blank? trimmed) trimmed))))
+              (catch Object _ nil))]
+    {:project-root (mcp/project-mcp-root top (os/cwd))
+     :user-root (mcp/user-mcp-root)
+     :read-text (:read-text access)
+     :file-exists (:file-exists access)
+     :list-dir (:list-dir access)}))
+
+(defn- cmd-mcp-register [args roots & [transport]]
+  (let [id (second args)]
+    (when (str/blank? (or id ""))
+      (do (println "Usage: attractor mcp register <id>")
+          (os/exit 1)))
+    (let [found (try (mcp/find-manifest roots id)
+                     (catch Object _
+                       (println (str "MCP manifest invalid for server: " id))
+                       (os/exit 1)))]
+      (when (nil? found)
+        (do (println (str "Unknown MCP server: " id))
+            (os/exit 1)))
+      (when (= :divergent (:cross-root found))
+        (do (println (str "MCP manifest for " id " differs across project and user roots; record an approval before use."))
+            (os/exit 1)))
+      (let [manifest (:manifest found)]
+        (when (str/blank? (str (:registration-endpoint manifest)))
+          (do (println (str "No registration endpoint declared for server: " id))
+              (os/exit 1)))
+        (let [result (try
+                       (mcp/perform-registration
+                         (or transport http/request)
+                         (:registration-endpoint manifest)
+                         (or (:registration manifest) {}))
+                       (catch Object error
+                         (println (str "Registration failed: " (ex-message error)))
+                         (os/exit 1)))]
+          (println (str "Client ID for " id ": " (:client-id result)))
+          (println "Store it as :client-id in user config; keep it out of the repo.")
+          (when (:credential-issued result)
+            (println "WARNING: the server also issued a credential, which is NOT shown or stored. Handle it out of band."))
+          (os/exit 0))))))
+
+
+(defn cmd-mcp [args]
+  (let [roots (cli-mcp-roots)
+        sub (first args)]
+    (if (or (nil? sub) (= "servers" sub))
+      (do (println "MCP servers (project root, then user root):")
+          (println (str "  project: " (:project-root roots)))
+          (println (str "  user:    " (or (:user-root roots) "(no home configured)")))
+          (println (mcp/format-servers-table (mcp/discover roots)))
+          (os/exit 0))
+      (if (= "authorize" sub)
+        (let [id (second args)
+              found (when-not (str/blank? (or id ""))
+                      (try (mcp/find-manifest roots id)
+                           (catch Object _ :invalid)))]
+          (if (map? found)
+            (if (= :divergent (:cross-root found))
+              (do (println (str "MCP manifest for " id " differs across project and user roots; record an approval before use."))
+                  (os/exit 1))
+              (do (println (mcp/authorize-guidance (:manifest found)))
+                  (os/exit 0)))
+            (do (println (if (= :invalid found)
+                           (str "MCP manifest invalid for server: " id)
+                           (str "Unknown MCP server: " (or id ""))))
+                (os/exit 1))))
+        (if (= "register" sub)
+          (cmd-mcp-register args roots)
+          (do (println "Usage: attractor mcp [servers|authorize <id>|register <id>]")
+              (os/exit 1)))))))
+
 (defn cmd-providers
   "providers: show the effective provider registry with each value's source."
   [_]
@@ -863,6 +942,7 @@
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)
       "providers" (cmd-providers rest-args)
+      "mcp" (cmd-mcp rest-args)
       "skills" (cmd-skills rest-args)
       "agent" (cmd-agent rest-args)
       "console" (cmd-console rest-args)

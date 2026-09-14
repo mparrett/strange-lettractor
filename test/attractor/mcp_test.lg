@@ -1,0 +1,559 @@
+(ns attractor.mcp-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.edn :as edn]
+            [clojure.core :as core]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]
+            [json :as json]
+            [attractor.mcp :as mcp]
+            [attractor.cli :as cli]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; ---------------------------------------------------------------------------
+;; Fixture helpers.
+;; ---------------------------------------------------------------------------
+
+(defn- fresh-dir [label]
+  (str (os/temp-dir) "/mcp-" label "-" (random-uuid)))
+
+(defn- manifest-for [id endpoint tools]
+  {:id id :revision "2026-09-14" :name (str "Server " id)
+   :description (str "Serves " id)
+   :transport :streamable-http :endpoint endpoint
+   :tools tools :resources []
+   :task-types ["research"]
+   :limits {:timeout-ms 5000 :max-bytes 8192}
+   :token-env "MCP_TEST_TOKEN"
+   :provenance {:operator "test" :license "MIT"}})
+
+(defn- query-tool []
+  {:name "quote" :description "Get a quote"
+   :class :pure-tool :side-effects :none
+   :schema {:type "object" :properties {:symbol {:type "string"}}}})
+
+(defn- write-manifest! [root id manifest]
+  (let [dir (str root "/" id)]
+    (io/mkdir dir)
+    (io/spit (str dir "/mcp.edn") (pr-str manifest))
+    dir))
+
+(defn- make-roots []
+  (let [base (fresh-dir "roots")]
+    {:project (str base "/proj/.attractor/mcp")
+     :user (str base "/user/.attractor/mcp")}))
+
+(defn- file-access []
+  {:read-text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+   :file-exists (fn [path] (some? (os/stat path)))
+   :list-dir (fn [path]
+               (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                              (os/ls path)))
+                    (catch Object _ [])))})
+
+(defn- base-opts [roots transport token-reader]
+  {:project-root (:project roots) :user-root (:user roots)
+   :read-text (:read-text (file-access)) :file-exists (:file-exists (file-access))
+   :list-dir (:list-dir (file-access)) :approvals {}
+   :transport transport :token-reader token-reader})
+
+(defn- journey-env []
+  (execution/make-environment
+    {:working_directory (fn [] "/repo")
+     :file_exists (fn [path] (some? (try (os/stat path) (catch Object _ nil))))
+     :read_text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+     :list_directory (fn [path _depth]
+                       (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                                      (os/ls path)))
+                            (catch Object _ [])))
+     :inspect_command (fn [_] {:exit_code 1 :stdout ""})}))
+
+(defn- rpc-result [id result]
+  (json/write-json {:jsonrpc "2.0" :id id :result result}))
+
+(defn- request-id [request]
+  (try (get (json/read-json (str (:body request))) "id")
+       (catch Object _ 1)))
+
+(defn- json-transport [calls body & [status]]
+  (fn [request]
+    (swap! calls conj request)
+    {:status (or status 200) :headers {"content-type" "application/json"} :body body}))
+
+;; ---------------------------------------------------------------------------
+;; Manifest validation.
+;; ---------------------------------------------------------------------------
+
+(deftest manifest-rejects-non-read-only-classes-and-bad-shape
+  (let [roots (make-roots)]
+    (doseq [[label manifest]
+            [["write-class"
+              (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                     :tools [(assoc (query-tool) :class :write)])]
+             ["bad-transport"
+              (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                     :transport :stdio)]
+             ["http-endpoint"
+              (manifest-for "demo" "http://m.example/mcp" [(query-tool)])]
+             ["missing-token"
+              (dissoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                      :token-env)]]]
+      (write-manifest! (:project roots) "demo" manifest)
+      (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                         (base-opts roots (fn [_] {:status 200 :headers {} :body "{}"})
+                                                    (fn [_] "tok")))
+                     (catch Object e e))]
+        (is (= :mcp-manifest-invalid (:category (ex-data err))) (str "case: " label))))))
+
+(defn- make-session-with-mcp [roots requests server-ids transport token-reader]
+  (let [profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        session (agent/make-session
+                  {:provider_profile profile :execution_env (journey-env)
+                   :max_subagent_depth 0 :project_docs []
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (mcp/admit-servers! session server-ids (base-opts roots transport token-reader))
+    session))
+
+
+(deftest localhost-http-endpoint-is-allowed
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "http://localhost:9/mcp" [(query-tool)]))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] {:status 200 :headers {} :body "{}"})
+                    (fn [_] "tok"))]
+      (try
+        (is (= ["demo"] (mapv :server_id (:mcp_servers @session))))
+        (finally (agent/close-session! session))))))
+
+(deftest unknown-server-fails-closed
+  (let [roots (make-roots)
+        err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["ghost"]
+                                     (base-opts roots (fn [_] {}) (fn [_] "tok")))
+                 (catch Object e e))]
+    (is (= :mcp-not-found (:category (ex-data err))))))
+
+(deftest missing-token-reference-fails-closed-with-guidance
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                       (base-opts roots (fn [_] {}) (fn [_] nil)))
+                   (catch Object e e))]
+      (is (= :mcp-auth-missing (:category (ex-data err))))
+      (is (= "MCP_TEST_TOKEN" (:token_env (ex-data err)))))))
+
+(deftest cross-root-divergence-needs-approval
+  (let [roots (make-roots)
+        _ (write-manifest! (:project roots) "demo"
+                           (manifest-for "demo" "https://p.example/mcp" [(query-tool)]))
+        _ (write-manifest! (:user roots) "demo"
+                           (manifest-for "demo" "https://u.example/mcp" [(query-tool)]))
+        err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                     (base-opts roots (fn [_] {}) (fn [_] "tok")))
+                 (catch Object e e))]
+    (is (= :mcp-cross-root-conflict (:category (ex-data err))))))
+
+;; ---------------------------------------------------------------------------
+;; Admission, tool calls, audit, refresh, failure.
+;; ---------------------------------------------------------------------------
+
+(deftest admission-registers-namespaced-tools-with-collision-check
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] {:status 200 :headers {} :body "{}"})
+                    (fn [_] "tok"))]
+      (try
+        (is (some? (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")))
+        (is (= ["demo"] (mapv :server_id (:mcp_servers @session))))
+        (finally (agent/close-session! session))))
+    (testing "collision with a local tool refuses"
+      (let [requests2 (atom [])
+            profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+            _ (profiles/register-tool!
+                (:tool_registry profile)
+                {:definition {:name "demo__quote" :description "local"
+                              :parameters {:type "object" :properties {}}}
+                 :executor (fn [_ _] "local")})
+            session2 (agent/make-session
+                       {:provider_profile profile :execution_env (journey-env)
+                        :max_subagent_depth 0 :project_docs []
+                        :complete_fn (fn [request]
+                                       (swap! requests2 conj request)
+                                       {:message {:role :assistant :content "done"} :tool_calls []})})
+            err (try (mcp/admit-servers!
+                       session2 ["demo"]
+                       (base-opts roots (fn [_] {:status 200 :headers {} :body "{}"})
+                                  (fn [_] "tok")))
+                     (catch Object e e))]
+        (try
+          (is (= :mcp-tool-collision (:category (ex-data err))))
+          (finally (agent/close-session! session2)))))))
+
+(deftest tool-call-sends-bearer-labels-output-and-audits
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [calls (atom []) requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (json-transport calls (rpc-result 1 {:content [{:type "text" :text "price 42"}]}))
+                    (fn [_] "tok-secret-1"))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)]
+          (is (str/includes? output "price 42"))
+          (is (str/includes? output "externally-supplied"))
+          (is (= "Bearer tok-secret-1" (get (:headers (last @calls)) "authorization")))
+          (let [entry (last @(:mcp_evidence @session))]
+            (is (= "demo" (:server entry)))
+            (is (= "quote" (:tool entry)))
+            (is (= 64 (count (:args-digest entry))))
+            (is (= 64 (count (:result-digest entry))))
+            (is (true? (:redacted entry)))
+            (is (not (str/includes? (pr-str entry) "tok-secret-1")))))
+        (finally (agent/close-session! session))))))
+
+(deftest refresh-flow-retries-once-and-keeps-tokens-in-memory
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [calls (atom []) seen-auth (atom [])
+          transport (fn [request]
+                      (swap! calls conj request)
+                      (let [url (:url request)]
+                        (cond (str/includes? url "oauth2/token")
+                              {:status 200 :headers {"content-type" "application/json"}
+                               :body (json/write-json {:access_token "tok-fresh" :expires_in 3600})}
+                              (= "Bearer tok-stale" (get (:headers request) "authorization"))
+                              (do (swap! seen-auth conj :stale)
+                                  {:status 401 :headers {} :body "expired"})
+                              :else
+                              (do (swap! seen-auth conj :fresh)
+                                  {:status 200 :headers {"content-type" "application/json"}
+                                   :body (rpc-result (request-id request) {:content [{:type "text" :text "ok"}]})}))))
+          tokens {"MCP_TEST_TOKEN" "tok-stale" "MCP_TEST_REFRESH" "tok-refresh"}
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport #(get tokens %))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)]
+          (is (str/includes? output "ok"))
+          (is (= [:stale :fresh] @seen-auth))
+          ;; Refresh produced a new access token without touching the store.
+          (is (= "tok-stale" (get tokens "MCP_TEST_TOKEN"))))
+        (finally (agent/close-session! session))))))
+
+(deftest failed-refresh-fails-closed
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [transport (fn [request]
+                      (if (str/includes? (:url request) "oauth2/token")
+                        {:status 400 :headers {} :body "denied"}
+                        {:status 401 :headers {} :body "expired"}))
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport
+                    #(get {"MCP_TEST_TOKEN" "tok-stale" "MCP_TEST_REFRESH" "tok-bad"} %))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              err (try ((:executor tool) {:symbol "AAA"} nil) (catch Object e e))]
+          (is (= :mcp-auth-failed (:category (ex-data err)))))
+        (finally (agent/close-session! session))))))
+
+(deftest unavailable-server-never-yields-empty-success
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] (throw (ex-info "connection refused" {})))
+                    (fn [_] "tok"))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              err (try ((:executor tool) {:symbol "AAA"} nil) (catch Object e e))]
+          (is (= :mcp-unavailable (:category (ex-data err)))))
+        (finally (agent/close-session! session))))))
+
+(deftest oversized-results-truncate-with-marker
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [big (apply str (repeat 9000 "v"))
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (json-transport (atom []) (rpc-result 1 {:content [{:type "text" :text big}]}))
+                    (fn [_] "tok"))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)
+              entry (last @(:mcp_evidence @session))]
+          (is (<= (count (bytes output)) 8192))
+          (is (str/includes? output "[MCP result truncated"))
+          (is (true? (:truncated entry))))
+        (finally (agent/close-session! session))))))
+
+(deftest resource-read-gates-uris-against-allowlist
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [])
+                            :resources [{:uri "mcp://demo/quotes" :description "Quotes"
+                                         :class :read-only-resource}] :tools []))
+    (let [calls (atom []) requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (json-transport calls (rpc-result 1 {:contents [{:uri "mcp://demo/quotes"
+                                                                     :text "q1"}]}))
+                    (fn [_] "tok"))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry])
+                     "demo__read_resource")]
+          (is (some? tool))
+          (let [ok ((:executor tool) {:uri "mcp://demo/quotes"} nil)]
+            (is (str/includes? ok "q1")))
+          (let [err (try ((:executor tool) {:uri "mcp://demo/other"} nil)
+                         (catch Object e e))]
+            (is (= :mcp-resource-denied (:category (ex-data err))))))
+        (finally (agent/close-session! session))))))
+
+;; ---------------------------------------------------------------------------
+;; Registration, guidance, lookup, approvals, session integration.
+;; ---------------------------------------------------------------------------
+
+(deftest perform-registration-returns-client-id-never-secret
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 201 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:client_id "cid-1" :client_secret "shh"})})
+        result (mcp/perform-registration
+                 transport "https://api.example/register" {:client_name "t"})]
+    (is (= "cid-1" (:client-id result)))
+    (is (true? (:credential-issued result)))
+    (is (not (str/includes? (pr-str result) "shh"))))
+  (let [err (try (mcp/perform-registration
+                   (fn [_] {:status 400 :headers {} :body "no"})
+                   "https://api.example/register" {})
+                 (catch Object e e))]
+    (is (= :mcp-protocol-error (:category (ex-data err))))))
+
+(deftest authorize-guidance-names-endpoint-scope-and-exports
+  (let [m (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                 :authorization-endpoint "https://api.example/authorize"
+                 :scope "internal")]
+    (let [guidance (mcp/authorize-guidance m)]
+      (is (str/includes? guidance "https://api.example/authorize"))
+      (is (str/includes? guidance "internal"))
+      (is (str/includes? guidance "export MCP_TEST_TOKEN="))
+      (is (not (str/includes? guidance "tok-"))))))
+
+(deftest find-manifest-locates-validates-and-misses
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [found (mcp/find-manifest
+                  {:project-root (:project roots) :user-root (:user roots)
+                   :read-text (:read-text (file-access))
+                   :file-exists (:file-exists (file-access))} "demo")]
+      (is (= "demo" (get-in found [:manifest :id])))
+      (is (= "project" (:root found))))
+    (is (nil? (mcp/find-manifest
+                {:project-root (:project roots) :user-root (:user roots)
+                 :read-text (:read-text (file-access))
+                 :file-exists (:file-exists (file-access))} "ghost")))))
+
+(deftest propose-approval-unlocks-divergent-roots
+  (let [roots (make-roots)
+        _ (write-manifest! (:project roots) "demo"
+                           (manifest-for "demo" "https://p.example/mcp" [(query-tool)]))
+        _ (write-manifest! (:user roots) "demo"
+                           (manifest-for "demo" "https://u.example/mcp" [(query-tool)]))
+        access {:project-root (:project roots) :user-root (:user roots)
+                :read-text (:read-text (file-access))
+                :file-exists (:file-exists (file-access))}
+        entry (mcp/propose-approval access "demo" "user")
+        requests (atom [])
+        profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        session (agent/make-session
+                  {:provider_profile profile :execution_env (journey-env)
+                   :max_subagent_depth 0 :project_docs []
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})
+        out (mcp/admit-servers!
+              session ["demo"]
+              (assoc (base-opts roots (fn [_] {:status 200 :headers {} :body "{}"})
+                                (fn [_] "tok"))
+                     :approvals entry))]
+    (try
+      (is (= "user" (:root (first (:servers out)))))
+      (is (= "https://u.example/mcp" (:endpoint (first (:servers out)))))
+      (finally (agent/close-session! session)))))
+
+(deftest make-session-mcp-selection-admits-and-records
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [previous (os/getenv "MCP_TEST_TOKEN")]
+      (os/setenv "MCP_TEST_TOKEN" "handoff-token")
+      (try
+        (let [requests (atom [])
+              profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+              session (agent/make-session
+                        {:provider_profile profile :execution_env (journey-env)
+                         :max_subagent_depth 0 :project_docs []
+                         :mcp ["demo"]
+                         :project_mcp_root (:project roots)
+                         :user_mcp_root (:user roots)
+                         :complete_fn (fn [request]
+                                        (swap! requests conj request)
+                                        {:message {:role :assistant :content "done"} :tool_calls []})})]
+          (try
+            (is (= ["demo"] (mapv :server_id (:mcp_servers @session))))
+            (is (= 64 (count (:mcp_config_digest @session))))
+            (is (some? (profiles/registry-get
+                         (get-in @session [:provider_profile :tool_registry])
+                         "demo__quote")))
+            (finally (agent/close-session! session))))
+        (finally (os/setenv "MCP_TEST_TOKEN" (or previous "")))))))
+
+;; ---------------------------------------------------------------------------
+;; CLI: servers list and authorize guidance against an isolated home.
+;; ---------------------------------------------------------------------------
+
+(deftest cli-mcp-servers-lists-declared-servers
+  (let [home (fresh-dir "home")
+        _ (io/mkdir (str home "/.attractor/mcp/demo"))
+        _ (io/spit (str home "/.attractor/mcp/demo/mcp.edn")
+                   (pr-str (manifest-for "demo" "https://m.example/mcp" [(query-tool)])))
+        previous (os/getenv "ATTRACTOR_HOME")]
+    (os/setenv "ATTRACTOR_HOME" home)
+    (try
+      (let [exits (atom [])
+            output (with-redefs [os/exit #(swap! exits conj %)]
+                     (with-out-str (cli/-main "mcp" "servers")))]
+        (is (= 0 (first @exits)))
+        (is (str/includes? output "demo @")))
+      (finally (os/setenv "ATTRACTOR_HOME" (or previous ""))))))
+
+(deftest cli-mcp-authorize-prints-handoff-guidance
+  (let [home (fresh-dir "home")
+        _ (io/mkdir (str home "/.attractor/mcp/demo"))
+        _ (io/spit (str home "/.attractor/mcp/demo/mcp.edn")
+                   (pr-str (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                                  :authorization-endpoint "https://api.example/authorize"
+                                  :scope "internal")))
+        previous (os/getenv "ATTRACTOR_HOME")]
+    (os/setenv "ATTRACTOR_HOME" home)
+    (try
+      (let [exits (atom [])
+            output (with-redefs [os/exit #(swap! exits conj %)]
+                     (with-out-str (cli/-main "mcp" "authorize" "demo")))]
+        (is (= 0 (first @exits)))
+        (is (str/includes? output "https://api.example/authorize"))
+        (is (str/includes? output "export MCP_TEST_TOKEN=")))
+      (let [exits (atom [])
+            output (with-redefs [os/exit #(swap! exits conj %)]
+                     (with-out-str (cli/-main "mcp" "authorize" "ghost")))]
+        (is (= 1 (first @exits)))
+        (is (str/includes? output "Unknown MCP server")))
+      (finally (os/setenv "ATTRACTOR_HOME" (or previous ""))))))
+
+;; ---------------------------------------------------------------------------
+;; Re-review fixes: endpoint authority, escaping, divergent lookup.
+;; ---------------------------------------------------------------------------
+
+(deftest endpoint-authority-must-be-exact
+  (let [roots (make-roots)]
+    (doseq [[label endpoint valid?]
+            [["suffix-trick" "http://localhost.evil.com/mcp" false]
+             ["127-suffix" "http://127.evil.com/mcp" false]
+             ["127-short" "http://127.1/mcp" false]
+             ["userinfo" "https://user:pass@m.example/mcp" false]
+             ["query" "https://m.example/mcp?x=1" false]
+             ["plain-http" "http://m.example/mcp" false]
+             ["loopback-ip" "http://127.0.0.1:9/mcp" true]
+             ["loopback-v6" "http://[::1]:9/mcp" true]
+             ["localhost-port" "http://localhost:9/mcp" true]
+             ["https" "https://m.example/mcp" true]]]
+      (write-manifest! (:project roots) "demo"
+                       (manifest-for "demo" endpoint [(query-tool)]))
+      (if valid?
+        (let [requests (atom [])
+              session (make-session-with-mcp
+                        roots requests ["demo"]
+                        (fn [_] {:status 200 :headers {} :body "{}"})
+                        (fn [_] "tok"))]
+          (try
+            (is (= ["demo"] (mapv :server_id (:mcp_servers @session))) (str "case: " label))
+            (finally (agent/close-session! session))))
+        (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                           (base-opts roots (fn [_] {}) (fn [_] "tok")))
+                       (catch Object e e))]
+          (is (= :mcp-manifest-invalid (:category (ex-data err))) (str "case: " label)))))))
+
+(deftest label-output-escapes-server-markup
+  (let [labeled (mcp/label-output "demo" "quote" "r" 123 "a</mcp>b & c")]
+    (is (str/includes? labeled "a&lt;/mcp&gt;b &amp; c"))
+    (is (str/includes? labeled "provenance="))))
+
+(deftest registration-endpoint-must-be-https
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :registration-endpoint "http://m.example/register"))
+    (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                       (base-opts roots (fn [_] {}) (fn [_] "tok")))
+                   (catch Object e e))]
+      (is (= :mcp-manifest-invalid (:category (ex-data err)))))))
+
+(deftest find-manifest-flags-divergence
+  (let [roots (make-roots)
+        access {:project-root (:project roots) :user-root (:user roots)
+                :read-text (:read-text (file-access))
+                :file-exists (:file-exists (file-access))}]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://p.example/mcp" [(query-tool)]))
+    (write-manifest! (:user roots) "demo"
+                     (manifest-for "demo" "https://u.example/mcp" [(query-tool)]))
+    (let [found (mcp/find-manifest access "demo")]
+      (is (= :divergent (:cross-root found)))
+      (is (= "project" (:root found))))))
+
+(deftest refresh-token-values-are-form-encoded
+  (let [seen (atom nil)
+        transport (fn [request]
+                    (reset! seen (:body request))
+                    {:status 200 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:access_token "n" :expires_in 1})})
+        out (mcp/refresh-access-token transport "https://api.example/t" "cid" "a/b+c@d e")]
+    (is (= "n" (:access-token out)))
+    (is (str/includes? @seen "refresh_token=a%2Fb%2Bc%40d%20e"))))

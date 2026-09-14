@@ -1,0 +1,171 @@
+(ns attractor.mcp-client-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [json :as json]
+            [attractor.mcp-client :as mcp-client]))
+
+;; Fake transports: synchronous fns from request map to response map.
+
+(defn- rpc-result [id result]
+  (json/write-json {:jsonrpc "2.0" :id id :result result}))
+
+(defn- rpc-error-body [id code message]
+  (json/write-json {:jsonrpc "2.0" :id id :error {:code code :message message}}))
+
+(defn- request-id [request]
+  (try (get (json/read-json (str (:body request))) "id")
+       (catch Object _ 1)))
+
+(defn- modern-json-transport [calls result]
+  (fn [request]
+    (swap! calls conj request)
+    {:status 200 :headers {"content-type" "application/json"}
+     :body (rpc-result (request-id request) result)}))
+
+(deftest modern-json-call-posts-envelope-without-session
+  (let [calls (atom [])
+        out (mcp-client/session-request!
+              (mcp-client/open-session {:transport (modern-json-transport calls {:ok true})
+                                        :endpoint "https://m.example/mcp"})
+              "tools/list" {})]
+    (is (= {"ok" true} (:result out)))
+    (is (= :modern (:mode out)))
+    (let [request (first @calls)]
+      (is (= :post (:method request)))
+      (is (= "https://m.example/mcp" (:url request)))
+      (is (nil? (get (:headers request) "mcp-session-id")))
+      (let [body (json/read-json (:body request))]
+        (is (= "2.0" (get body "jsonrpc")))
+        (is (= "tools/list" (get body "method")))))))
+
+(deftest modern-sse-stream-parses-per-request-events
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 200 :headers {"content-type" "text/event-stream"}
+                     :body (str "event: message\ndata: "
+                                (json/write-json {:jsonrpc "2.0" :id (request-id request)
+                                                  :result {:x 1}})
+                                "\n\n")})
+        out (mcp-client/session-request!
+              (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+              "ping" {})]
+    (is (= {"x" 1} (:result out)))
+    (is (= :modern (:mode out)))))
+
+(deftest remote-error-surfaces-code-without-fallback
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 200 :headers {"content-type" "application/json"}
+                     :body (rpc-error-body (request-id request) -32602 "Unknown tool")})
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+                   "tools/call" {})
+                 (catch Object e e))]
+    (is (= :mcp-remote-error (:category (ex-data err))))
+    (is (= -32602 (:code (ex-data err))))
+    (is (= 1 (count @calls)))))
+
+(deftest modern-400-error-stays-modern-without-handshake
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 400 :headers {"content-type" "application/json"}
+                     :body (rpc-error-body (request-id request) -32600 "Invalid request")})
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+                   "tools/call" {})
+                 (catch Object e e))]
+    (is (= :mcp-request-error (:category (ex-data err))))
+    (is (= 1 (count @calls)))))
+
+(deftest empty-400-falls-back-to-legacy-handshake
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    (let [body (str (:body request))
+                          session (get (:headers request) "mcp-session-id")]
+                      (cond (str/includes? body "notifications/initialized")
+                            {:status 202 :headers {} :body ""}
+                            (str/includes? body "initialize")
+                            {:status 200 :headers {"Mcp-Session-Id" "sess-9"}
+                             :body (rpc-result (request-id request) {:protocolVersion "2025-11-25"})}
+                            (= "sess-9" session)
+                            {:status 200 :headers {"content-type" "application/json"}
+                             :body (rpc-result (request-id request) {:tools []})}
+                            :else {:status 400 :headers {} :body ""})))
+        handle (mcp-client/open-session {:transport transport :endpoint "https://legacy.example/mcp"})
+        out (mcp-client/session-request! handle "tools/call" {:name "t"})]
+    (is (= {"tools" []} (:result out)))
+    (is (= :legacy (:mode out)))
+    (is (= "sess-9" (:session-id @handle)))
+    (let [methods (mapv :method @calls)]
+      (is (every? #(= :post %) methods)))
+    (mcp-client/close-session! handle)
+    (let [last-call (last @calls)]
+      (is (= :delete (:method last-call)))
+      (is (= "sess-9" (get (:headers last-call) "mcp-session-id"))))))
+
+(deftest legacy-handshake-without-session-id-fails-closed
+  (let [transport (fn [request]
+                    (if (str/includes? (str (:body request)) "initialize")
+                      {:status 200 :headers {} :body (rpc-result (request-id request) {})}
+                      {:status 400 :headers {} :body ""}))
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://legacy.example/mcp"})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-protocol-error (:category (ex-data err))))))
+
+(deftest modern-close-is-a-no-op-without-delete
+  (let [calls (atom [])
+        handle (mcp-client/open-session {:transport (modern-json-transport calls {})
+                                         :endpoint "https://m.example/mcp"})]
+    (mcp-client/session-request! handle "ping" {})
+    (mcp-client/close-session! handle)
+    (is (every? #(= :post %) (mapv :method @calls)))))
+
+(deftest transport-throw-means-unavailable-never-empty
+  (let [transport (fn [_] (throw (ex-info "connection refused" {})))
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-unavailable (:category (ex-data err))))))
+
+(deftest unauthorized-surfaces-auth-failure
+  (let [transport (fn [_] {:status 401 :headers {} :body "nope"})
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-auth-failed (:category (ex-data err))))))
+
+(deftest slow-transport-times-out
+  (let [transport (fn [_] (do (clojure.core/sleep 5000) {:status 200 :headers {} :body "{}"}))
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"
+                                             :timeout-ms 30})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-timeout (:category (ex-data err))))))
+
+(deftest aborted-call-cancels
+  (let [transport (fn [_] {:status 200 :headers {} :body "{}"})
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"
+                                             :aborted? (fn [] true)})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-cancelled (:category (ex-data err))))))
+
+(deftest malformed-body-fails-closed
+  (let [transport (fn [_] {:status 200 :headers {"content-type" "application/json"}
+                           :body "not json at all"})
+        err (try (mcp-client/session-request!
+                   (mcp-client/open-session {:transport transport :endpoint "https://m.example/mcp"})
+                   "ping" {})
+                 (catch Object e e))]
+    (is (= :mcp-protocol-error (:category (ex-data err))))))

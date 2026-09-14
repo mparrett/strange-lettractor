@@ -596,3 +596,51 @@
         run (skill-eval/run-task task ["demo"] (session-opts roots) worker)]
     (is (some? @seen))
     (is (= (count (bytes @seen)) (:prompt-bytes run)))))
+
+;; ---------------------------------------------------------------------------
+;; P7: MCP evidence is excluded from deterministic hard gates.
+;; ---------------------------------------------------------------------------
+
+(deftest hard-gates-ignore-mcp-evidence-blocks
+  (let [summary {:final-text "work <mcp server=\"demo\" tool=\"quote\" provenance=\"externally-supplied\">RESULT: demo-ok</mcp> tail"
+                 :tool-names [] :tool-call-count 0}]
+    (is (false? (:pass (skill-eval/evaluate-gates {:contains ["demo-ok"]} summary))))
+    (is (true? (:pass (skill-eval/evaluate-gates {:contains ["work"]} summary))))
+    (is (true? (:pass (skill-eval/evaluate-gates {:absent ["demo-ok"]} summary))))))
+
+(deftest mcp-gate-inputs-validated-and-recorded-inert
+  (let [task {:id "t" :prompt "p" :relevant-skills [] :split :holdout
+              :hard-gates {:contains ["p"]} :mcp-gate-inputs ["demo/quote"]}
+        corpus (skill-eval/validate-corpus! {:tasks [task]})]
+    (is (= ["demo/quote"] (:mcp-gate-inputs (first (:tasks corpus)))))
+    (let [err (try (skill-eval/validate-corpus!
+                     {:tasks [(assoc task :mcp-gate-inputs [""]) ]})
+                   (catch Object e e))]
+      (is (= :skill-eval-corpus-invalid (:category (ex-data err)))))))
+
+(deftest anchored-strip-leaves-bare-lookalikes-visible
+  (let [summary {:final-text "note <mcp>demo-ok</mcp> tail"
+                 :tool-names [] :tool-call-count 0}]
+    (is (true? (:pass (skill-eval/evaluate-gates {:contains ["demo-ok"]} summary))))
+    (is (false? (:pass (skill-eval/evaluate-gates {:absent ["demo-ok"]} summary))))))
+
+(deftest custom-gates-receive-stripped-text
+  (is (= "work  tail"
+         (skill-eval/strip-mcp-blocks "work <mcp server=\"s\" provenance=\"externally-supplied\">hidden</mcp> tail")))
+  (is (str/includes? (skill-eval/strip-mcp-blocks "keep <mcp>demo-ok</mcp> end") "demo-ok")))
+
+(deftest custom-gate-fn-observes-stripped-session-text
+  (let [roots {:project "/nonexistent-proj" :user "/nonexistent-user"}
+        seen (atom nil)
+        task {:id "t" :prompt "Do it." :relevant-skills [] :split :holdout :hard-gates {}}
+        worker (fn [_] {:message {:role :assistant
+                                  :content "plain <mcp server=\"s\" provenance=\"externally-supplied\">SECRET</mcp> done"}
+                        :tool_calls []})
+        run (skill-eval/run-task task [] (session-opts roots) worker
+                                 [{:id "no-secret"
+                                   :fn (fn [summary] (reset! seen (:final-text summary))
+                                         {:pass (boolean (not (str/includes? (:final-text summary) "SECRET")))
+                                          :detail "secret must stay out of gates"})}])]
+    (is (true? (:success run)))
+    (is (str/includes? @seen "plain"))
+    (is (not (str/includes? @seen "SECRET")))))
