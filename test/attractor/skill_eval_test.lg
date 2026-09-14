@@ -1,0 +1,598 @@
+(ns attractor.skill-eval-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.edn :as edn]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]
+            [attractor.skill-eval :as skill-eval]
+            [attractor.cli :as cli]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; ---------------------------------------------------------------------------
+;; Fixture helpers: temp skill roots, journey env, scripted workers.
+;; ---------------------------------------------------------------------------
+
+(defn- fresh-dir [label]
+  (str (os/temp-dir) "/skilleval-" label "-" (random-uuid)))
+
+(defn- write-skill! [root id body & [description]]
+  (let [dir (str root "/" id)]
+    (io/mkdir dir)
+    (io/spit (str dir "/SKILL.md") body)
+    (io/spit (str dir "/skill.edn")
+             (pr-str {:id id :revision "2026-09-14"
+                      :name (str "Skill " id)
+                      :description (or description (str "Does " id " things."))
+                      :files [{:path "SKILL.md" :sha256 (hash/sha256 body)}]}))
+    dir))
+
+(defn- make-roots []
+  (let [base (fresh-dir "roots")]
+    {:project (str base "/proj/.attractor/skills")
+     :user (str base "/user/.attractor/skills")}))
+
+(defn- journey-env []
+  (execution/make-environment
+    {:working_directory (fn [] "/repo")
+     :file_exists (fn [path] (some? (try (os/stat path) (catch Object _ nil))))
+     :read_text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+     :list_directory (fn [path _depth]
+                       (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                                      (os/ls path)))
+                            (catch Object _ [])))
+     :inspect_command (fn [_] {:exit_code 1 :stdout ""})}))
+
+(defn- session-opts [roots]
+  {:provider_profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+   :execution_env (journey-env)
+   :max_subagent_depth 0
+   :project_docs []
+   :project_skills_root (:project roots)
+   :user_skills_root (:user roots)})
+
+(defn- demo-corpus []
+  {:tasks
+   [{:id "summarize" :prompt "Summarize the report."
+     :relevant-skills ["demo"] :split :holdout
+     :hard-gates {:contains ["RESULT: demo-ok"]}}
+    {:id "anchor-task" :prompt "Do the anchor thing."
+     :relevant-skills [] :split :anchor
+     :hard-gates {:contains ["anchor"]}}]})
+
+;; A worker that simulates skill influence deterministically: it reads the
+;; assembled system prompt and changes behavior when the demo skill is loaded.
+(defn- skill-aware-worker [ok-marker]
+  (fn [request]
+    (let [system-text (get-in request [:messages 0 :content])]
+      (if (str/includes? system-text "Demo procedure.")
+        {:message {:role :assistant :content (str "RESULT: " ok-marker)}
+         :tool_calls []
+         :usage {:input_tokens 100 :output_tokens 10 :total_tokens 110}}
+        {:message {:role :assistant :content "RESULT: plain"}
+         :tool_calls []}))))
+
+;; ---------------------------------------------------------------------------
+;; Corpus validation and holdout split.
+;; ---------------------------------------------------------------------------
+
+(deftest corpus-requires-tasks-prompt-gates-and-split
+  (is (some? (skill-eval/validate-corpus! (demo-corpus))))
+  (doseq [bad [{}
+               {:tasks []}
+               {:tasks [{:id "" :prompt "p" :relevant-skills [] :split :holdout :hard-gates {}}]}
+               {:tasks [{:id "t" :prompt "" :relevant-skills [] :split :holdout :hard-gates {}}]}
+               {:tasks [{:id "t" :prompt "p" :relevant-skills [] :split :bogus :hard-gates {}}]}
+               {:tasks [{:id "t" :prompt "p" :relevant-skills [] :split :holdout
+                         :hard-gates {:unknown-gate [1]}}]}]]
+    (let [err (try (skill-eval/validate-corpus! bad) (catch Object e e))]
+      (is (= :skill-eval-corpus-invalid (:category (ex-data err)))))))
+
+(deftest holdout-selects-only-holdout-tasks
+  (let [tasks (skill-eval/holdout-tasks (demo-corpus))]
+    (is (= ["summarize"] (mapv :id tasks)))))
+
+(deftest corpus-digest-is-stable-for-identical-corpora
+  (is (= (skill-eval/corpus-digest (demo-corpus)) (skill-eval/corpus-digest (demo-corpus)))))
+
+;; ---------------------------------------------------------------------------
+;; Data gate predicates.
+;; ---------------------------------------------------------------------------
+
+(deftest data-gates-evaluate-deterministically
+  (let [summary {:final-text "RESULT: demo-ok done"
+                 :tool-names ["read_file" "read_file"]
+                 :tool-call-count 2}
+        result (skill-eval/evaluate-gates
+                 {:contains ["demo-ok"] :absent ["explosion"]
+                  :tool-called ["read_file"] :tool-not-called ["shell"]
+                  :max-tool-calls 2}
+                 summary)]
+    (is (true? (:pass result)))
+    (is (= 5 (count (:details result)))))
+  (let [result (skill-eval/evaluate-gates {:contains ["missing"] :max-tool-calls 1}
+                                          {:final-text "nope" :tool-names [] :tool-call-count 2})]
+    (is (false? (:pass result)))))
+
+;; ---------------------------------------------------------------------------
+;; run-task: scripted worker journey with and without the skill.
+;; ---------------------------------------------------------------------------
+
+(deftest run-task-with-skill-passes-gates-baseline-fails
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        task (first (:tasks (demo-corpus)))
+        worker (skill-aware-worker "demo-ok")
+        with-skill (skill-eval/run-task task ["demo"] (session-opts roots) worker)
+        baseline (skill-eval/run-task task [] (session-opts roots) worker)]
+    (is (= :ok (:status with-skill)))
+    (is (true? (:success with-skill)))
+    (is (false? (:success baseline)))
+    (is (> (:prompt-bytes with-skill) (:prompt-bytes baseline)))
+    (is (some? (:skills-config-digest with-skill)))
+    (is (nil? (:skills-config-digest baseline)))
+    (is (= {:input_tokens 100 :output_tokens 10 :total_tokens 110} (:usage with-skill)))
+    (is (some? (:latency-ms with-skill)))))
+
+(deftest run-task-records-unknown-usage-when-worker-omits-it
+  (let [roots (make-roots)
+        task (first (:tasks (demo-corpus)))
+        worker (fn [_] {:message {:role :assistant :content "RESULT: plain"} :tool_calls []})
+        run (skill-eval/run-task task [] (session-opts roots) worker)]
+    (is (= :unknown (:usage run)))))
+
+(deftest run-task-counts-tool-calls-across-turns
+  (let [roots (make-roots)
+        data-file (str (fresh-dir "data") "/notes.txt")
+        _ (io/mkdir (subs data-file 0 (str/last-index-of data-file "/")))
+        _ (io/spit data-file "hello")
+        calls (atom 0)
+        worker (fn [_]
+                 (swap! calls inc)
+                 (if (= 1 @calls)
+                   {:message {:role :assistant :content "reading"}
+                    :tool_calls [{:name "read_file" :id "c1"
+                                  :arguments {:path data-file}}]}
+                   {:message {:role :assistant :content "RESULT: demo-ok"}
+                    :tool_calls []}))
+        task (assoc (first (:tasks (demo-corpus))) :hard-gates {:contains ["demo-ok"]})
+        run (skill-eval/run-task task [] (session-opts roots) worker)]
+    (is (true? (:success run)))
+    (is (= 1 (:tool-calls run)))
+    (is (= ["read_file"] (:tool-names run)))))
+
+(deftest run-task-rejects-ambiguous-session-options
+  (let [roots (make-roots)
+        task (first (:tasks (demo-corpus)))
+        worker (fn [_] {:message {:role :assistant :content "x"} :tool_calls []})
+        err (try (skill-eval/run-task task ["demo"]
+                                      (assoc (session-opts roots) :skills ["other"])
+                                      worker)
+                 (catch Object e e))]
+    (is (= :skill-eval-configuration (:category (ex-data err))))))
+
+(deftest run-task-records-worker-errors-without-throwing
+  (let [roots (make-roots)
+        task (first (:tasks (demo-corpus)))
+        worker (fn [_] (throw (ex-info "boom" {})))
+        run (skill-eval/run-task task [] (session-opts roots) worker)]
+    (is (= :error (:status run)))
+    (is (false? (:success run)))
+    (is (some? (:error run)))))
+
+;; ---------------------------------------------------------------------------
+;; Matrix, report, verdict, promotion.
+;; ---------------------------------------------------------------------------
+
+(defn- matrix-fixture []
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        _ (write-skill! (:project roots) "other" "Other procedure.")
+        corpus {:tasks
+                [{:id "summarize" :prompt "Summarize the report."
+                  :relevant-skills ["demo"] :split :holdout
+                  :hard-gates {:contains ["RESULT: demo-ok"]}}
+                 {:id "tidy" :prompt "Tidy the desk."
+                  :relevant-skills [] :split :holdout
+                  :hard-gates {:contains ["RESULT: tidy-ok"]}}]}
+        workers {"summarize" (skill-aware-worker "demo-ok")
+                 "tidy" (fn [request]
+                          (let [system-text (get-in request [:messages 0 :content])]
+                            ;; The irrelevant skill actively harms this task.
+                            (if (str/includes? system-text "Other procedure.")
+                              {:message {:role :assistant :content "RESULT: tidy-BROKEN"}
+                               :tool_calls []}
+                              {:message {:role :assistant :content "RESULT: tidy-ok"}
+                               :tool_calls []})))}]
+    {:roots roots :corpus corpus :workers workers}))
+
+(deftest run-matrix-produces-baseline-correct-and-irrelevant-runs
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "other" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})]
+    (is (= 6 (count (:runs matrix))))
+    (let [by-key (into {} (map (fn [run] [[(:task-id run) (:selection-kind run)] run])
+                               (:runs matrix)))]
+      (is (true? (:success (get by-key ["summarize" :correct]))))
+      (is (false? (:success (get by-key ["summarize" :baseline]))))
+      ;; "other" is irrelevant to summarize: same outcome as baseline, extra bytes.
+      (is (= (:success (get by-key ["summarize" :baseline]))
+             (:success (get by-key ["summarize" :irrelevant]))))
+      (is (> (:prompt-bytes (get by-key ["summarize" :irrelevant]))
+             (:prompt-bytes (get by-key ["summarize" :baseline]))))
+      ;; tidy + other skill: gate flip vs baseline.
+      (is (true? (:success (get by-key ["tidy" :baseline]))))
+      (is (false? (:success (get by-key ["tidy" :irrelevant])))))))
+
+(deftest aggregate-report-flags-regression-and-verdict-holds
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "other" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "other" :revision "2026-09-14"}
+                                            {})]
+    (is (= ["summarize" "tidy"] (:task-ids report)))
+    (is (= 1 (count (:regressions report))))
+    (is (= "tidy" (:task-id (first (:regressions report)))))
+    (is (= :hold (:verdict report)))
+    (is (seq (:reasons report)))
+    (is (some? (:digest report)))
+    ;; Latency is observed but excluded from the digest.
+    (is (= (:digest report)
+           (skill-eval/report-digest (assoc-in report [:runs 0 :latency-ms] 999999))))))
+
+(deftest clean-report-verdict-awaits-human-approval-never-promotes
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        ;; Evaluate "demo" instead: summarize benefits, tidy unaffected.
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        ;; tidy worker ignores the demo skill, so no regression.
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "demo" :revision "2026-09-14"}
+                                            {})]
+    (is (empty? (:regressions report)))
+    (is (= :awaiting-human-approval (:verdict report)))
+    (is (not (= :promoted (:verdict report))))))
+
+(deftest record-promotion-requires-valid-human-record-on-clean-report
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "demo" :revision "2026-09-14"}
+                                            {})
+        record (skill-eval/record-promotion
+                 {:skill-id "demo" :revision "2026-09-14" :report report
+                  :approver "ada" :statement "Reviewed the report; ship it."
+                  :timestamp "2026-09-14T00:00:00Z"})]
+    (is (= :skill-promotion (:type record)))
+    (is (= (:digest report) (:report-digest record)))
+    ;; Tampered report fails report validation first.
+    (let [err (try (skill-eval/record-promotion
+                      {:skill-id "demo" :revision "2026-09-14"
+                       :report (assoc report :verdict :hold)
+                       :approver "ada" :statement "x" :timestamp "t"})
+                   (catch Object e e))]
+      (is (= :skill-eval-report-invalid (:category (ex-data err)))))
+    ;; Valid report but wrong skill identity refuses at promotion.
+    (let [err (try (skill-eval/record-promotion
+                      {:skill-id "other" :revision "2026-09-14" :report report
+                       :approver "ada" :statement "x" :timestamp "t"})
+                   (catch Object e e))]
+      (is (= :skill-promotion-refused (:category (ex-data err)))))
+    ;; Blank human fields refuse.
+    (let [err (try (skill-eval/record-promotion
+                      {:skill-id "demo" :revision "2026-09-14" :report report
+                       :approver "" :statement "x" :timestamp "t"})
+                   (catch Object e e))]
+      (is (= :skill-promotion-refused (:category (ex-data err)))))))
+
+(deftest record-promotion-refuses-hold-verdict-reports
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "other" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "other" :revision "2026-09-14"}
+                                            {})
+        err (try (skill-eval/record-promotion
+                    {:skill-id "other" :revision "2026-09-14" :report report
+                     :approver "ada" :statement "ship it" :timestamp "t"})
+                 (catch Object e e))]
+    (is (= :hold (:verdict report)))
+    (is (= :skill-promotion-refused (:category (ex-data err))))))
+
+(deftest validate-report-recomputes-digest-and-structure
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "demo" :revision "2026-09-14"}
+                                            {})]
+    (is (some? (skill-eval/validate-report! report)))
+    (let [err (try (skill-eval/validate-report!
+                      (assoc report :verdict :promoted))
+                   (catch Object e e))]
+      (is (= :skill-eval-report-invalid (:category (ex-data err)))))))
+
+;; ---------------------------------------------------------------------------
+;; CLI: eval-report prints verdicts; promote gates on human flags.
+;; ---------------------------------------------------------------------------
+
+(defn- cli-report-fixture [candidate-id]
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id candidate-id :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id candidate-id :revision "2026-09-14"}
+                                            {})
+        dir (fresh-dir "cli-eval")
+        _ (io/mkdir dir)
+        path (str dir "/report.edn")
+        _ (io/spit path (pr-str report))]
+    {:report report :path path :dir dir}))
+
+(deftest cli-eval-report-prints-verdict-summary
+  (let [{:keys [path]} (cli-report-fixture "demo")
+        exits (atom [])
+        output (with-redefs [os/exit #(swap! exits conj %)]
+                 (with-out-str (cli/-main "skills" "eval-report" path)))]
+    (is (= 0 (first @exits)))
+    (is (str/includes? output "awaiting-human-approval"))
+    (is (str/includes? output "summarize"))
+    (is (str/includes? output "candidate: demo"))))
+
+(deftest cli-promote-writes-record-only-with-human-flags
+  (let [{:keys [path dir]} (cli-report-fixture "demo")
+        out-file (str dir "/promotion.edn")
+        exits (atom [])
+        output (with-redefs [os/exit #(swap! exits conj %)]
+                 (with-out-str (cli/-main "skills" "promote"
+                                          "--report" path "--skill" "demo"
+                                          "--approver" "ada" "--statement" "Ship it."
+                                          "--out" out-file)))]
+    (is (= 0 (first @exits)))
+    (is (str/includes? output "Recorded promotion"))
+    (let [record (edn/read-string (io/slurp out-file))]
+      (is (= :skill-promotion (:type record)))
+      (is (= "ada" (:approver record)))))
+  (testing "missing human flags refuse with usage"
+    (let [{:keys [path]} (cli-report-fixture "demo")
+          exits (atom [])
+          output (with-redefs [os/exit #(swap! exits conj %)]
+                   (with-out-str (cli/-main "skills" "promote"
+                                            "--report" path "--skill" "demo")))]
+      (is (= 1 (first @exits)))
+      (is (str/includes? output "Usage:")))))
+
+(deftest cli-promote-refuses-hold-verdict-reports
+  (let [{:keys [path]} (cli-report-fixture "other")
+        exits (atom [])
+        output (with-redefs [os/exit #(swap! exits conj %)]
+                 (with-out-str (cli/-main "skills" "promote"
+                                          "--report" path "--skill" "other"
+                                          "--approver" "ada" "--statement" "Ship it."
+                                          "--out" (str (fresh-dir "x") "/p.edn"))))]
+    (is (= 1 (first @exits)))
+    (is (str/includes? output "Promotion refused"))))
+
+(deftest format-report-summary-names-verdict-and-tasks
+  (let [{:keys [report]} (cli-report-fixture "demo")
+        summary (skill-eval/format-report-summary report)]
+    (is (str/includes? summary "awaiting-human-approval"))
+    (is (str/includes? summary "tidy"))))
+
+;; ---------------------------------------------------------------------------
+;; Re-review fixes: correct-run flips, skip coverage, forged reports,
+;; false-activation divergence, custom gates, growth, config errors.
+;; ---------------------------------------------------------------------------
+
+(deftest correct-run-breakage-holds-promotion
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        corpus {:tasks [{:id "fragile" :prompt "Be careful."
+                         :relevant-skills ["demo"] :split :holdout
+                         :hard-gates {:contains ["RESULT: ok"]}}]}
+        workers {"fragile" (fn [request]
+                             (let [system-text (get-in request [:messages 0 :content])]
+                               {:message {:role :assistant
+                                          :content (if (str/includes? system-text "Demo procedure.")
+                                                     "RESULT: broken by skill"
+                                                     "RESULT: ok")}
+                                :tool_calls []}))}
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "demo" :revision "2026-09-14"}
+                                            {})]
+    (is (= :hold (:verdict report)))
+    (is (= ["correct-run-breaks-task"]
+           (:regression-reasons (first (:comparisons report)))))))
+
+(deftest all-skipped-irrelevant-coverage-holds-promotion
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        corpus {:tasks [{:id "only" :prompt "Just do it."
+                         :relevant-skills ["demo"] :split :holdout
+                         :hard-gates {:contains ["RESULT: ok"]}}]}
+        workers {"only" (fn [_] {:message {:role :assistant :content "RESULT: ok"}
+                                 :tool_calls []})}
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "demo" :revision "2026-09-14"}
+                                            {})]
+    (is (= :skipped (:status (first (filter #(= :irrelevant (:selection-kind %)) (:runs matrix))))))
+    (is (= :hold (:verdict report)))
+    (is (= :no-irrelevant-coverage (:reason (first (:reasons report)))))))
+
+(deftest forged-reports-fail-validation-despite-matching-digest
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "demo" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        clean (skill-eval/aggregate-report corpus (:runs matrix)
+                                           {:id "demo" :revision "2026-09-14"}
+                                           {})
+        re-digested (fn [report] (assoc report :digest (skill-eval/report-digest report)))]
+    (testing "verdict/regressions contradiction"
+      (let [err (try (skill-eval/validate-report!
+                       (re-digested (assoc clean :regressions [{:task-id "tidy" :reasons ["x"]}])))
+                     (catch Object e e))]
+        (is (= :skill-eval-report-invalid (:category (ex-data err))))))
+    (testing "hold verdict without regressions"
+      (let [err (try (skill-eval/validate-report!
+                       (re-digested (assoc clean :verdict :hold)))
+                     (catch Object e e))]
+        (is (= :skill-eval-report-invalid (:category (ex-data err))))))
+    (testing "dropped comparison"
+      (let [err (try (skill-eval/validate-report!
+                       (re-digested (assoc clean
+                                           :comparisons (subvec (:comparisons clean) 0 1))))
+                     (catch Object e e))]
+        (is (= :skill-eval-report-invalid (:category (ex-data err))))))
+    (testing "missing run kind"
+      (let [err (try (skill-eval/validate-report!
+                       (re-digested (assoc clean :runs (subvec (:runs clean) 0 5))))
+                     (catch Object e e))]
+        (is (= :skill-eval-report-invalid (:category (ex-data err))))))))
+
+(deftest false-activation-means-behavior-divergence
+  (let [{:keys [roots corpus workers]} (matrix-fixture)
+        matrix (skill-eval/run-matrix
+                 corpus {:candidate {:id "other" :revision "2026-09-14"}
+                         :session-opts (session-opts roots)
+                         :workers workers})
+        report (skill-eval/aggregate-report corpus (:runs matrix)
+                                            {:id "other" :revision "2026-09-14"}
+                                            {})
+        by-task (into {} (map (fn [c] [(:task-id c) c]) (:comparisons report)))]
+    ;; summarize + other: identical failure, no tool change — harmless.
+    (is (false? (:present (:false-activation (get by-task "summarize")))))
+    ;; tidy + other: gate flip — real divergence.
+    (is (true? (:present (:false-activation (get by-task "tidy")))))))
+
+(deftest custom-gates-record-pass-and-throw-as-fail
+  (let [roots (make-roots)
+        task (assoc (first (:tasks (demo-corpus))) :hard-gates {:contains ["RESULT: plain"]})
+        worker (fn [_] {:message {:role :assistant :content "RESULT: plain"} :tool_calls []})
+        run (skill-eval/run-task task [] (session-opts roots) worker
+                                 [{:id "length" :fn (fn [summary] {:pass true :detail "fine"})}
+                                  {:id "boom" :fn (fn [_] (throw (ex-info "gate bug" {})))}])]
+    (is (= 2 (count (:custom run))))
+    (is (true? (:pass (first (:custom run)))))
+    (is (false? (:pass (second (:custom run)))))
+    (is (str/includes? (:detail (second (:custom run))) "gate threw"))
+    (is (false? (:success run)))))
+
+(deftest tool-growth-regresses-unless-policy-tolerates-it
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "other" "Other procedure.")
+        data-file (str (fresh-dir "growth") "/f.txt")
+        _ (io/mkdir (subs data-file 0 (str/last-index-of data-file "/")))
+        _ (io/spit data-file "hi")
+        corpus {:tasks [{:id "grow" :prompt "Grow."
+                         :relevant-skills [] :split :holdout
+                         :hard-gates {:contains ["RESULT: ok"]}}]}
+        calls (atom 0)
+        worker (fn [request]
+                 (let [n (swap! calls inc)
+                       system-text (get-in request [:messages 0 :content])]
+                   (if (and (= 1 n) (str/includes? system-text "Other procedure."))
+                     {:message {:role :assistant :content "working"}
+                      :tool_calls [{:name "read_file" :id "c1"
+                                    :arguments {:path data-file}}]}
+                     {:message {:role :assistant :content "RESULT: ok"}
+                      :tool_calls []})))
+        ;; NOTE: the calls atom is shared across matrix runs, so only the
+        ;; first executed run takes the tool branch. Run the irrelevant
+        ;; selection first via a direct pair instead of the matrix.
+        _ (reset! calls 0)
+        irrelevant (skill-eval/run-task (first (:tasks corpus)) ["other"]
+                                        (session-opts roots) worker)
+        _ (reset! calls 99)
+        baseline (skill-eval/run-task (first (:tasks corpus)) []
+                                      (session-opts roots) worker)]
+    (is (true? (:success irrelevant)))
+    (is (true? (:success baseline)))
+    (is (= 1 (:tool-calls irrelevant)))
+    (is (= 0 (:tool-calls baseline)))
+    (let [runs [(assoc baseline :selection-kind :baseline)
+                (assoc baseline :selection-kind :correct)
+                (assoc irrelevant :selection-kind :irrelevant)]
+          strict (skill-eval/aggregate-report corpus runs
+                                              {:id "other" :revision "2026-09-14"}
+                                              {})
+          lenient (skill-eval/aggregate-report corpus runs
+                                               {:id "other" :revision "2026-09-14"}
+                                               {:max-tool-call-delta 1})]
+      (is (= :hold (:verdict strict)))
+      (is (= ["tool-call-growth"]
+             (:regression-reasons (first (:comparisons strict)))))
+      (is (= :awaiting-human-approval (:verdict lenient))))))
+
+(deftest duplicate-task-ids-are-rejected
+  (let [task {:id "dup" :prompt "p" :relevant-skills [] :split :holdout :hard-gates {}}
+        err (try (skill-eval/validate-corpus! {:tasks [task task]}) (catch Object e e))]
+    (is (= :skill-eval-corpus-invalid (:category (ex-data err))))))
+
+(deftest empty-gate-vectors-are-rejected
+  (let [err (try (skill-eval/validate-corpus!
+                   {:tasks [{:id "t" :prompt "p" :relevant-skills [] :split :holdout
+                             :hard-gates {:absent []}}]})
+                 (catch Object e e))]
+    (is (= :skill-eval-corpus-invalid (:category (ex-data err))))))
+
+(deftest complete-fn-in-session-opts-is-rejected
+  (let [roots (make-roots)
+        task (first (:tasks (demo-corpus)))
+        worker (fn [_] {:message {:role :assistant :content "x"} :tool_calls []})
+        err (try (skill-eval/run-task task []
+                                      (assoc (session-opts roots)
+                                             :complete_fn worker)
+                                      worker)
+                 (catch Object e e))]
+    (is (= :skill-eval-configuration (:category (ex-data err))))))
+
+(deftest missing-worker-for-holdout-task-is-rejected
+  (let [roots (make-roots)
+        err (try (skill-eval/run-matrix
+                   (demo-corpus)
+                   {:candidate {:id "demo" :revision "r"}
+                    :session-opts (session-opts roots)
+                    :workers {}})
+                 (catch Object e e))]
+    (is (= :skill-eval-configuration (:category (ex-data err))))))
+
+(deftest prompt-bytes-measure-the-first-request
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        seen (atom nil)
+        worker (fn [request]
+                 (when (nil? @seen)
+                   (reset! seen (get-in request [:messages 0 :content])))
+                 {:message {:role :assistant :content "RESULT: demo-ok"} :tool_calls []})
+        task (first (:tasks (demo-corpus)))
+        run (skill-eval/run-task task ["demo"] (session-opts roots) worker)]
+    (is (some? @seen))
+    (is (= (count (bytes @seen)) (:prompt-bytes run)))))

@@ -1,0 +1,550 @@
+(ns attractor.skill-eval
+  "Deterministic skill evaluation on held-out task subsets (Slice D, WP-2).
+
+   This namespace measures a candidate skill revision, it does not promote
+   it. Workers are scripted :complete_fn stand-ins, so evaluation is offline
+   and deterministic; model-backed workers are deferred to Slice C. For each
+   holdout task the runner executes a baseline run (no skills), a correct
+   run (the task relevant skills), and an irrelevant run (the candidate
+   where the task does not list it), then compares benefit, cost,
+   activation behavior, and irrelevant-task regressions.
+
+   Promotion is a separate human act: promotion-verdict never yields
+   :promoted (a clean report yields :awaiting-human-approval), and
+   record-promotion only builds a promotion record from explicit human
+   fields whose report digest matches. Nothing here mutates skill loading
+   or trusted behavior."
+  (:require [attractor.agent :as agent]
+            [attractor.llm :as llm]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]))
+
+(def default-policy
+  "Default comparison policy. Only behavioral regressions hold promotion:
+   gate flips and tool-call growth beyond tolerance. Prompt-byte overhead
+   is reported as cost, never a regression by itself."
+  {:max-tool-call-delta 0})
+
+(def gate-keys [:contains :absent :tool-called :tool-not-called :max-tool-calls])
+
+(defn- fail! [category data]
+  (throw (ex-info (str "Skill eval: " (name category)) (assoc data :category category))))
+
+(defn- non-blank-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
+(defn- string-vec? [value]
+  (and (vector? value) (every? non-blank-string? value)))
+
+(defn- split-value [split]
+  (cond (= :holdout split) :holdout
+        (= "holdout" split) :holdout
+        (= :anchor split) :anchor
+        (= "anchor" split) :anchor
+        :else nil))
+
+;; ---------------------------------------------------------------------------
+;; Corpus.
+;; ---------------------------------------------------------------------------
+
+(defn- validate-gates! [gates task-id]
+  (when-not (map? gates)
+    (fail! :skill-eval-corpus-invalid {:task_id task-id :reason :gates-must-be-a-map}))
+  (doseq [[key value] gates]
+    (when-not (contains? (set gate-keys) key)
+      (fail! :skill-eval-corpus-invalid {:task_id task-id :reason :unknown-gate :gate key})))
+  (doseq [key [:contains :absent :tool-called :tool-not-called]]
+    (when (contains? gates key)
+      (when-not (string-vec? (get gates key))
+        (fail! :skill-eval-corpus-invalid {:task_id task-id :reason :gate-needs-string-vector :gate key}))
+      (when (empty? (get gates key))
+        (fail! :skill-eval-corpus-invalid {:task_id task-id :reason :gate-vector-must-be-non-empty :gate key}))))
+  (when (contains? gates :max-tool-calls)
+    (let [limit (:max-tool-calls gates)]
+      (when-not (and (integer? limit) (>= limit 0))
+        (fail! :skill-eval-corpus-invalid {:task_id task-id :reason :max-tool-calls-needs-non-negative-int}))))
+  gates)
+
+(defn- validate-task! [task seen-ids]
+  (when-not (map? task)
+    (fail! :skill-eval-corpus-invalid {:reason :task-must-be-a-map}))
+  (let [id (:id task)]
+    (when-not (non-blank-string? id)
+      (fail! :skill-eval-corpus-invalid {:reason :task-needs-non-blank-id}))
+    (when (contains? seen-ids id)
+      (fail! :skill-eval-corpus-invalid {:task_id id :reason :duplicate-task-id}))
+    (when-not (non-blank-string? (:prompt task))
+      (fail! :skill-eval-corpus-invalid {:task_id id :reason :task-needs-non-blank-prompt}))
+    (when-not (and (vector? (:relevant-skills task))
+                   (every? non-blank-string? (:relevant-skills task)))
+      (fail! :skill-eval-corpus-invalid {:task_id id :reason :relevant-skills-must-be-string-vector}))
+    (when (nil? (split-value (:split task)))
+      (fail! :skill-eval-corpus-invalid {:task_id id :reason :split-must-be-anchor-or-holdout}))
+    (validate-gates! (:hard-gates task) id)
+    id))
+
+(defn validate-corpus!
+  "Validate a task corpus map. Returns it unchanged or throws
+   :skill-eval-corpus-invalid. The corpus stays pure data: custom gate
+   functions travel separately at run time and are flagged in runs."
+  [corpus]
+  (when-not (map? corpus)
+    (fail! :skill-eval-corpus-invalid {:reason :corpus-must-be-a-map}))
+  (let [tasks (:tasks corpus)]
+    (when-not (and (vector? tasks) (seq tasks))
+      (fail! :skill-eval-corpus-invalid {:reason :tasks-must-be-non-empty}))
+    (loop [remaining tasks seen #{}]
+      (when (seq remaining)
+        (recur (rest remaining) (conj seen (validate-task! (first remaining) seen)))))
+    corpus))
+
+(defn corpus-digest
+  "Stable digest over corpus data. Identical corpora compare equal."
+  [corpus]
+  (hash/sha256 (pr-str corpus)))
+
+(defn holdout-tasks
+  "The evaluation subset: tasks whose split is holdout, in corpus order."
+  [corpus]
+  (vec (filter #(= :holdout (split-value (:split %))) (:tasks corpus))))
+
+;; ---------------------------------------------------------------------------
+;; Data gates.
+;; ---------------------------------------------------------------------------
+
+(defn- check-one-gate [gate value summary]
+  (let [text (str (:final-text summary))
+        names (vec (or (:tool-names summary) []))
+        tool-count (or (:tool-call-count summary) 0)]
+    (case gate
+      :contains {:gate gate :pass (boolean (some #(str/includes? text %) value))
+                 :detail (str "contains one of " (count value))}
+      :absent {:gate gate :pass (boolean (not-any? #(str/includes? text %) value))
+               :detail (str "absent all of " (count value))}
+      :tool-called {:gate gate :pass (boolean (some #(contains? (set names) %) value))
+                    :detail (str "called one of " (count value))}
+      :tool-not-called {:gate gate :pass (boolean (not-any? #(contains? (set names) %) value))
+                        :detail (str "never called " (count value))}
+      :max-tool-calls {:gate gate :pass (<= tool-count value)
+                       :detail (str tool-count " <= " value)})))
+
+(defn evaluate-gates
+  "Evaluate data gates over a session summary
+   {:final-text :tool-names :tool-call-count}. Unknown gate keys are
+   ignored here (validate-corpus! rejects them for corpora). Returns
+   {:pass :details} in fixed gate order."
+  [gates summary]
+  (let [details (vec (keep (fn [gate]
+                             (when (contains? gates gate)
+                               (check-one-gate gate (get gates gate) summary)))
+                           gate-keys))]
+    {:pass (every? :pass details) :details details}))
+
+;; ---------------------------------------------------------------------------
+;; Session mining.
+;; ---------------------------------------------------------------------------
+
+(defn- assistant-turns [history]
+  (filter #(= :assistant (:type %)) (or history [])))
+
+(defn- tool-name-of [call]
+  (or (:name call) (get call "name") ""))
+
+(defn- run-tool-calls [history]
+  (let [turns (assistant-turns history)
+        calls (vec (mapcat #(or (:tool_calls %) []) turns))]
+    {:count (count calls) :names (mapv tool-name-of calls)}))
+
+(defn- total-usage
+  "Sum scripted worker usage totals. :unknown when no turn reports usage.
+   Only known counters survive; nothing is fabricated."
+  [history]
+  (let [reported (vec (keep :usage (assistant-turns history)))]
+    (if (empty? reported)
+      :unknown
+      (into {} (remove (fn [[_ value]] (nil? value)))
+            (reduce llm/add-usage nil reported)))))
+
+(defn- prompt-bytes-of [request]
+  (let [text (get-in request [:messages 0 :content])]
+    (if (string? text) (count (bytes text)) 0)))
+
+;; ---------------------------------------------------------------------------
+;; Single task run.
+;; ---------------------------------------------------------------------------
+
+(defn- validate-run-args! [task selection session-opts]
+  (when-not (map? task)
+    (fail! :skill-eval-configuration {:reason :task-must-be-a-map}))
+  (when-not (and (vector? selection) (every? non-blank-string? selection))
+    (fail! :skill-eval-configuration {:reason :selection-must-be-string-vector}))
+  (when-not (map? session-opts)
+    (fail! :skill-eval-configuration {:reason :session-opts-must-be-a-map}))
+  (when (contains? session-opts :skills)
+    (fail! :skill-eval-configuration {:reason :session-opts-must-not-set-skills}))
+  (when (contains? session-opts :complete_fn)
+    (fail! :skill-eval-configuration {:reason :session-opts-must-not-set-complete-fn}))
+  (when (nil? (:prompt task))
+    (fail! :skill-eval-configuration {:reason :task-needs-prompt})))
+
+(defn- validate-custom-gates! [custom-gates]
+  (let [gates (or custom-gates [])]
+    (when-not (and (vector? gates)
+                   (every? (fn [gate] (and (map? gate) (some? (:id gate))
+                                           (fn? (:fn gate))))
+                           gates))
+      (fail! :skill-eval-configuration {:reason :custom-gates-need-id-and-fn}))
+    gates))
+
+(defn- run-custom-gate [gate summary]
+  (try
+    (let [outcome ((:fn gate) summary)]
+      (if (map? outcome)
+        {:gate :custom :id (:id gate) :pass (boolean (:pass outcome))
+         :detail (str (:detail outcome))}
+        {:gate :custom :id (:id gate) :pass (boolean outcome) :detail "custom"}))
+    (catch Object error
+      {:gate :custom :id (:id gate) :pass false
+       :detail (str "gate threw: " (ex-message error))})))
+
+(defn- drive-session [task selection session-opts complete-fn]
+  (let [captured (atom {})
+        wrapped (fn [request]
+                  (when-not (contains? @captured :request)
+                    (swap! captured assoc :request request))
+                  (complete-fn request))
+        session (agent/make-session
+                  (assoc session-opts
+                         :skills (vec selection)
+                         :complete_fn wrapped))]
+    (try
+      (let [final (agent/process-input! session (str (:prompt task)))]
+        {:status :ok
+         :final-text (or final "")
+         :history (:history @session)
+         :request (:request @captured)
+         :skills-config-digest (:skills_config_digest @session)})
+      (finally (agent/close-session! session)))))
+
+(defn run-task
+  "Drive one task with an explicit skill selection through a fresh agent
+   session using the scripted complete-fn worker. custom-gates is a vector
+   of {:id :fn} evaluated over the session summary and recorded as :custom.
+   Worker/session failures are recorded as :error runs, never thrown."
+  [task selection session-opts complete-fn & [custom-gates]]
+  (validate-run-args! task selection session-opts)
+  (let [gates (validate-custom-gates! custom-gates)
+        t0 (System/currentTimeMillis)
+        outcome (try (drive-session task selection session-opts complete-fn)
+                     (catch Object error
+                       {:status :error :error (ex-message error)
+                        :final-text "" :history [] :request nil
+                        :skills-config-digest nil}))
+        history (:history outcome)
+        calls (run-tool-calls history)
+        summary {:final-text (:final-text outcome)
+                 :tool-names (:names calls)
+                 :tool-call-count (:count calls)}
+        data-gates (evaluate-gates (or (:hard-gates task) {}) summary)
+        custom (mapv #(run-custom-gate % summary) gates)
+        success (boolean (and (= :ok (:status outcome))
+                              (:pass data-gates)
+                              (every? :pass custom)))]
+    {:task-id (:id task)
+     :split (split-value (:split task))
+     :selection (vec selection)
+     :status (:status outcome)
+     :error (:error outcome)
+     :success success
+     :gates (:details data-gates)
+     :custom custom
+     :tool-calls (:count calls)
+     :tool-names (:names calls)
+     :prompt-bytes (prompt-bytes-of (:request outcome))
+     :usage (total-usage history)
+     :latency-ms (- (System/currentTimeMillis) t0)
+     :skills-config-digest (:skills-config-digest outcome)}))
+
+;; ---------------------------------------------------------------------------
+;; Matrix over holdout tasks.
+;; ---------------------------------------------------------------------------
+
+(defn- validate-matrix-opts! [corpus opts]
+  (let [candidate (:candidate opts)]
+    (when-not (and (map? candidate) (non-blank-string? (:id candidate)))
+      (fail! :skill-eval-configuration {:reason :candidate-needs-id})))
+  (when-not (map? (:session-opts opts))
+    (fail! :skill-eval-configuration {:reason :session-opts-must-be-a-map}))
+  (when-not (map? (:workers opts))
+    (fail! :skill-eval-configuration {:reason :workers-must-map-task-id-to-fn}))
+  (doseq [task (holdout-tasks corpus)]
+    (when-not (fn? (get (:workers opts) (:id task)))
+      (fail! :skill-eval-configuration {:reason :holdout-task-needs-worker
+                                       :task_id (:id task)})))
+  (when (some? (:irrelevant opts))
+    (when-not (map? (:irrelevant opts))
+      (fail! :skill-eval-configuration {:reason :irrelevant-must-map-task-id-to-selection})))
+  (when (some? (:custom-gates opts))
+    (when-not (map? (:custom-gates opts))
+      (fail! :skill-eval-configuration {:reason :custom-gates-must-map-task-id-to-gates}))))
+
+(defn- irrelevant-selection [task candidate-id overrides]
+  (cond (contains? overrides (:id task)) (get overrides (:id task))
+        (contains? (set (:relevant-skills task)) candidate-id) :skip
+        :else [candidate-id]))
+
+(defn- run-task-kind [task kind selection session-opts workers customs]
+  (let [run (run-task task selection session-opts
+                      (get workers (:id task))
+                      (get customs (:id task) []))]
+    (assoc run :selection-kind kind)))
+
+(defn run-matrix
+  "Run every holdout task three ways: :baseline (no skills), :correct (the
+   task relevant skills), and :irrelevant (opts :irrelevant override per
+   task, else the candidate where the task does not list it, else :skipped).
+   Returns {:corpus-digest :candidate :runs}."
+  [corpus opts]
+  (validate-corpus! corpus)
+  (validate-matrix-opts! corpus opts)
+  (let [candidate-id (get-in opts [:candidate :id])
+        session-opts (:session-opts opts)
+        workers (:workers opts)
+        overrides (or (:irrelevant opts) {})
+        customs (or (:custom-gates opts) {})
+        runs (vec (mapcat
+                    (fn [task]
+                      (let [baseline (run-task-kind task :baseline [] session-opts workers customs)
+                            relevant (vec (:relevant-skills task))
+                            correct (run-task-kind task :correct relevant session-opts workers customs)
+                            sel (irrelevant-selection task candidate-id overrides)]
+                        (if (= :skip sel)
+                          [baseline correct
+                           {:task-id (:id task) :split (split-value (:split task))
+                            :selection-kind :irrelevant :status :skipped}]
+                          [baseline correct
+                           (run-task-kind task :irrelevant sel session-opts workers customs)])))
+                    (holdout-tasks corpus)))]
+    {:corpus-digest (corpus-digest corpus)
+     :candidate (:candidate opts)
+     :runs runs}))
+
+;; ---------------------------------------------------------------------------
+;; Comparison, verdict, report.
+;; ---------------------------------------------------------------------------
+
+(defn- find-run [runs task-id kind]
+  (some (fn [run]
+          (when (and (= task-id (:task-id run)) (= kind (:selection-kind run)))
+            run))
+        runs))
+
+(defn- compare-one-task [task baseline correct irrelevant policy]
+  (let [relevant (vec (:relevant-skills task))
+        tool-delta (- (:tool-calls correct) (:tool-calls baseline))
+        prompt-delta (- (:prompt-bytes correct) (:prompt-bytes baseline))
+        benefit {:present (boolean (and (:success correct)
+                                        (or (not (:success baseline))
+                                            (< (:tool-calls correct) (:tool-calls baseline)))))
+                 :tool-delta tool-delta
+                 :prompt-delta prompt-delta}
+        missed {:present (boolean (and (seq relevant) (not (:success baseline))))
+                :unselected-relevant relevant}
+        correct-breaks (boolean (and (:success baseline) (not (:success correct))))
+        base {:task-id (:id task)
+              :baseline-ok (:success baseline)
+              :correct-ok (:success correct)
+              :benefit benefit
+              :missed-activation missed}]
+    (if (= :skipped (:status irrelevant))
+      (assoc base
+             :irrelevant :skipped
+             :irrelevant-executed false
+             :false-activation {:present false :reason :skipped}
+             :regression correct-breaks
+             :regression-reasons (if correct-breaks ["correct-run-breaks-task"] []))
+      (let [i-tool-delta (- (:tool-calls irrelevant) (:tool-calls baseline))
+            i-prompt-delta (- (:prompt-bytes irrelevant) (:prompt-bytes baseline))
+            gate-flip (boolean (and (:success baseline) (not (:success irrelevant))))
+            cost-growth (> i-tool-delta (:max-tool-call-delta policy))
+            diverged (boolean (or (not (= (:success irrelevant) (:success baseline)))
+                                  (not (= (:tool-calls irrelevant) (:tool-calls baseline)))))
+            reasons (vec (concat (when correct-breaks ["correct-run-breaks-task"])
+                                 (when gate-flip ["gate-flip-pass-to-fail"])
+                                 (when cost-growth ["tool-call-growth"])))]
+        (assoc base
+               :irrelevant-ok (:success irrelevant)
+               :irrelevant-executed true
+               :false-activation {:present diverged
+                                  :tool-delta i-tool-delta
+                                  :prompt-delta i-prompt-delta}
+               :regression (boolean (seq reasons))
+               :regression-reasons reasons)))))
+
+(defn promotion-verdict
+  "Pure verdict over task comparisons. Regressions hold promotion, as does
+   zero irrelevant-run coverage (regressions cannot be assessed without
+   at least one executed irrelevant run); otherwise the skill awaits
+   explicit human approval. :promoted is never produced here."
+  [comparisons]
+  (let [regressed (vec (filter :regression comparisons))
+        covered (vec (filter :irrelevant-executed comparisons))]
+    (cond (seq regressed)
+          {:verdict :hold
+           :reasons (mapv (fn [comparison]
+                            {:task-id (:task-id comparison)
+                             :reasons (:regression-reasons comparison)})
+                          regressed)}
+          (empty? covered)
+          {:verdict :hold
+           :reasons [{:reason :no-irrelevant-coverage
+                      :detail (str "all " (count comparisons)
+                                   " holdout tasks skip irrelevant runs")}]}
+          :else
+          {:verdict :awaiting-human-approval
+           :reasons [{:summary (str "no regressions across " (count comparisons)
+                                    " holdout tasks; human approval still required")}]})))
+
+(defn report-digest
+  "Stable digest over a report. Wall-clock latency is observed but
+   excluded, so reruns compare equal."
+  [report]
+  (hash/sha256
+    (pr-str (-> report
+                (dissoc :digest)
+                (assoc :runs (mapv #(dissoc % :latency-ms) (:runs report)))))))
+
+(defn aggregate-report
+  "Compare matrix runs per holdout task and judge the candidate revision.
+   policy merges over default-policy. Returns the report including
+   :comparisons, :regressions, :verdict, :reasons, and :digest."
+  [corpus runs candidate policy]
+  (validate-corpus! corpus)
+  (let [tasks (holdout-tasks corpus)
+        merged (merge default-policy (or policy {}))
+        comparisons
+        (mapv (fn [task]
+                (let [baseline (find-run runs (:id task) :baseline)
+                      correct (find-run runs (:id task) :correct)
+                      irrelevant (find-run runs (:id task) :irrelevant)]
+                  (when (or (nil? baseline) (nil? correct) (nil? irrelevant))
+                    (fail! :skill-eval-configuration
+                           {:reason :matrix-missing-task-kind
+                            :task_id (:id task)}))
+                  (compare-one-task task baseline correct irrelevant merged)))
+              tasks)
+        verdict (promotion-verdict comparisons)
+        regressions (vec (keep (fn [comparison]
+                                 (when (:regression comparison)
+                                   {:task-id (:task-id comparison)
+                                    :reasons (:regression-reasons comparison)}))
+                               comparisons))
+        report {:type :skill-eval-report
+                :corpus-digest (corpus-digest corpus)
+                :candidate candidate
+                :task-ids (mapv :id tasks)
+                :runs (vec runs)
+                :comparisons comparisons
+                :regressions regressions
+                :verdict (:verdict verdict)
+                :reasons (:reasons verdict)}]
+    (assoc report :digest (report-digest report))))
+
+(defn validate-report!
+  "Validate a report map: structure, verdict values, and digest match.
+   Returns it unchanged or throws :skill-eval-report-invalid."
+  [report]
+  (when-not (map? report)
+    (fail! :skill-eval-report-invalid {:reason :report-must-be-a-map}))
+  (when-not (= :skill-eval-report (:type report))
+    (fail! :skill-eval-report-invalid {:reason :wrong-report-type}))
+  (doseq [key [:corpus-digest :candidate :task-ids :runs :comparisons
+               :regressions :verdict :reasons :digest]]
+    (when-not (contains? report key)
+      (fail! :skill-eval-report-invalid {:reason :missing-key :key key})))
+  (when-not (contains? #{:awaiting-human-approval :hold} (:verdict report))
+    (fail! :skill-eval-report-invalid {:reason :unknown-verdict}))
+  (let [comparisons (:comparisons report)
+        task-ids (:task-ids report)]
+    (when-not (and (vector? comparisons) (seq comparisons))
+      (fail! :skill-eval-report-invalid {:reason :comparisons-must-be-non-empty}))
+    (when-not (= (set (map :task-id comparisons)) (set task-ids))
+      (fail! :skill-eval-report-invalid {:reason :comparisons-must-cover-task-ids}))
+    (when-not (= (count comparisons) (count task-ids))
+      (fail! :skill-eval-report-invalid {:reason :comparisons-must-match-task-ids-once}))
+    (doseq [task-id task-ids]
+      (doseq [kind [:baseline :correct :irrelevant]]
+        (when-not (some (fn [run]
+                          (and (= task-id (:task-id run))
+                               (= kind (:selection-kind run))))
+                        (:runs report))
+          (fail! :skill-eval-report-invalid {:reason :runs-must-cover-task-kind
+                                            :task_id task-id :kind kind}))))
+    (let [regressed? (boolean (seq (:regressions report)))]
+      (when-not (= (= :hold (:verdict report)) regressed?)
+        (fail! :skill-eval-report-invalid {:reason :verdict-must-match-regressions}))))
+  (when-not (= (:digest report) (report-digest report))
+    (fail! :skill-eval-report-invalid {:reason :digest-mismatch}))
+  report)
+
+;; ---------------------------------------------------------------------------
+;; Human-approval promotion (record only, never automatic).
+;; ---------------------------------------------------------------------------
+
+(defn record-promotion
+  "Build a promotion record from explicit human fields. Refuses with
+   :skill-promotion-refused when the report is invalid, its digest does
+   not match, its verdict is not :awaiting-human-approval, the skill
+   identity differs from the report candidate, or any human field is
+   blank. Returned records change no trusted behavior by themselves."
+  [{:keys [skill-id revision report approver statement timestamp]}]
+  (validate-report! report)
+  (let [refusals
+        (cond (not (= :awaiting-human-approval (:verdict report)))
+              {:reason :report-verdict-not-approvable}
+              (not (and (= skill-id (get-in report [:candidate :id]))
+                        (= revision (get-in report [:candidate :revision]))))
+              {:reason :skill-identity-mismatch}
+              (not (non-blank-string? approver))
+              {:reason :approver-required}
+              (not (non-blank-string? statement))
+              {:reason :statement-required}
+              (not (non-blank-string? timestamp))
+              {:reason :timestamp-required}
+              :else nil)]
+    (when refusals
+      (fail! :skill-promotion-refused refusals)))
+  {:type :skill-promotion
+   :skill-id skill-id
+   :revision revision
+   :report-digest (:digest report)
+   :approver approver
+   :statement statement
+   :timestamp timestamp})
+
+(defn format-report-summary
+  "Pure one-screen rendering of an evaluation report for operators."
+  [report]
+  (let [lines (vec (concat [(str "Skill evaluation report")
+                            (str "  candidate: " (get-in report [:candidate :id])
+                                 " @ " (get-in report [:candidate :revision]))
+                            (str "  corpus:  " (:corpus-digest report))
+                            (str "  tasks:   " (str/join ", " (:task-ids report)))
+                            (str "  verdict: " (name (:verdict report)))
+                            (str "  digest:  " (:digest report))]
+                           (mapv (fn [comparison]
+                                   (str "  - " (:task-id comparison)
+                                        " baseline:" (if (:baseline-ok comparison) "pass" "fail")
+                                        " correct:" (if (:correct-ok comparison) "pass" "fail")
+                                        " irrelevant:"
+                                        (if (= :skipped (:irrelevant comparison))
+                                          "skipped"
+                                          (if (:irrelevant-ok comparison) "pass" "fail"))
+                                        (if (:regression comparison)
+                                          (str " REGRESSION " (str/join "," (:regression-reasons comparison)))
+                                          "")))
+                                 (:comparisons report))))]
+    (str/join "\n" lines)))

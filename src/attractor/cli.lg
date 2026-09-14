@@ -25,7 +25,9 @@
             [attractor.ids :as ids]
             [attractor.providers :as providers]
             [attractor.skills :as skills]
-            [clojure.core :as core]))
+            [attractor.skill-eval :as skill-eval]
+            [clojure.core :as core]
+            [clojure.edn :as edn]))
 
 (defn- find-arg-val [args flag]
   (loop [rem args]
@@ -656,6 +658,69 @@
       (println (str "  user:    " (get-in entry [id :user-digest])))
       (os/exit 0))))
 
+(defn- read-eval-report! [path]
+  (let [text (try (io/slurp path) (catch Object _ nil))]
+    (when (nil? text)
+      (println (str "Cannot read report file: " path))
+      (os/exit 1))
+    (let [report (try (edn/read-string text)
+                      (catch Object _
+                        (println (str "Report is not EDN: " path))
+                        (os/exit 1)))]
+      (try
+        (skill-eval/validate-report! report)
+        (catch Object error
+          (println (str "Invalid report: " (ex-message error)))
+          (os/exit 1))))))
+
+(defn- cmd-skills-eval-report [args]
+  (let [path (second args)]
+    (when (str/blank? (or path ""))
+      (do (println "Usage: attractor skills eval-report <report-file>")
+          (os/exit 1)))
+    (println (skill-eval/format-report-summary (read-eval-report! path)))
+    (os/exit 0)))
+
+(defn- promote-record-or-exit [report skill-id revision approver statement]
+  (try
+    (skill-eval/record-promotion
+      {:skill-id skill-id
+       :revision (or revision (get-in report [:candidate :revision]))
+       :report report
+       :approver approver
+       :statement statement
+       :timestamp (str (System/currentTimeMillis))})
+    (catch Object error
+      (do (println (str "Promotion refused: " (ex-message error)))
+          (os/exit 1)))))
+
+(defn- write-promotion-or-exit [record out-path skill-id]
+  (try
+    (do (io/spit out-path (pr-str record))
+        (println (str "Recorded promotion for " skill-id " in " out-path))
+        (os/exit 0))
+    (catch Object _
+      (do (println (str "Cannot write promotion file: " out-path))
+          (os/exit 1)))))
+
+(defn- cmd-skills-promote [args]
+  (let [report-path (find-arg-val args "--report")
+        skill-id (find-arg-val args "--skill")
+        revision (find-arg-val args "--revision")
+        approver (find-arg-val args "--approver")
+        statement (find-arg-val args "--statement")
+        out-path (find-arg-val args "--out")]
+    (when (or (str/blank? (or report-path ""))
+              (str/blank? (or skill-id ""))
+              (str/blank? (or approver ""))
+              (str/blank? (or statement ""))
+              (str/blank? (or out-path "")))
+      (do (println "Usage: attractor skills promote --report <file> --skill <id> [--revision <rev>] --approver <name> --statement <text> --out <file>")
+          (os/exit 1)))
+    (let [report (read-eval-report! report-path)
+          record (promote-record-or-exit report skill-id revision approver statement)]
+      (write-promotion-or-exit record out-path skill-id))))
+
 (defn- cmd-skills-revoke [args access]
   (let [id (second args)
         path (skills/default-approvals-path)]
@@ -694,8 +759,12 @@
           (cmd-skills-approve args access)
           (if (= "revoke" sub)
             (cmd-skills-revoke args access)
-            (do (println "Usage: attractor skills [approvals|approve <skill-id> --winner project|user|revoke <skill-id>]")
-                (os/exit 1))))))))
+            (if (= "eval-report" sub)
+              (cmd-skills-eval-report args)
+              (if (= "promote" sub)
+                (cmd-skills-promote args)
+                (do (println "Usage: attractor skills [approvals|approve <skill-id> --winner project|user|revoke <skill-id>|eval-report <file>|promote --report <file> --skill <id> --approver <n> --statement <t> --out <file>]")
+                    (os/exit 1))))))))))
 
 (defn cmd-providers
   "providers: show the effective provider registry with each value's source."
