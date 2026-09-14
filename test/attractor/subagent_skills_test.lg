@@ -1,0 +1,199 @@
+(ns attractor.subagent-skills-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; WP-3: spawn_agent skill selection reaches the child session.
+
+(defn- fresh-dir [label]
+  (str (os/temp-dir) "/subskills-" label "-" (random-uuid)))
+
+(defn- write-skill! [root id body]
+  (let [dir (str root "/" id)]
+    (io/mkdir dir)
+    (io/spit (str dir "/SKILL.md") body)
+    (io/spit (str dir "/skill.edn")
+             (pr-str {:id id :revision "2026-09-14"
+                      :name (str "Skill " id)
+                      :description (str "Does " id " things.")
+                      :files [{:path "SKILL.md" :sha256 (hash/sha256 body)}]}))
+    dir))
+
+(defn- make-roots []
+  (let [base (fresh-dir "roots")]
+    {:project (str base "/proj/.attractor/skills")
+     :user (str base "/user/.attractor/skills")}))
+
+(defn- journey-env []
+  (execution/make-environment
+    {:working_directory (fn [] "/repo")
+     :file_exists (fn [path] (some? (try (os/stat path) (catch Object _ nil))))
+     :read_text (fn [path] (try (io/slurp path) (catch Object _ nil)))
+     :list_directory (fn [path _depth]
+                       (try (vec (map (fn [entry] (if (map? entry) (:name entry) (str entry)))
+                                      (os/ls path)))
+                            (catch Object _ [])))
+     :inspect_command (fn [_] {:exit_code 1 :stdout ""})}))
+
+(defn- make-parent [roots requests & [extra]]
+  (agent/make-session
+    (merge {:provider_profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+            :execution_env (journey-env)
+            :project_docs []
+            :project_skills_root (:project roots)
+            :user_skills_root (:user roots)
+            :complete_fn (fn [request]
+                           (swap! requests conj request)
+                           {:message {:role :assistant :content "done"} :tool_calls []})}
+           extra)))
+
+(defn- spawn-and-join [parent args]
+  (let [id (:agent_id (agent/spawn-subagent! parent args))]
+    (agent/wait-subagent! parent id)
+    (get-in @parent [:subagents id :session])))
+
+(defn- system-texts [requests]
+  (mapv #(get-in % [:messages 0 :content]) @requests))
+
+(deftest spawn-agent-tool-schema-advertises-skills
+  (let [roots (make-roots)
+        requests (atom [])
+        parent (make-parent roots requests)]
+    (try
+      (let [tool (profiles/registry-get
+                   (get-in @parent [:provider_profile :tool_registry])
+                   "spawn_agent")
+            skills-prop (get-in tool [:definition :parameters :properties :skills])]
+        (is (some? tool))
+        (is (= "array" (:type skills-prop)))
+        (is (= {:type "string"} (:items skills-prop))))
+      (finally (agent/close-session! parent)))))
+
+(deftest explicit-selection-reaches-child-prompt-and-evidence
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        _ (write-skill! (:project roots) "other" "Other procedure.")
+        requests (atom [])
+        parent (make-parent roots requests {:skills []})]
+    (try
+      (let [child (spawn-and-join parent {"task" "do demo work" "skills" ["demo"]})]
+        (is (= ["demo"] (mapv :skill_id (:skill_evidence @child))))
+        (is (some #(str/includes? % "Demo procedure.") (system-texts requests)))
+        (is (not-any? #(str/includes? % "Other procedure.") (system-texts requests))))
+      (finally (agent/close-session! parent)))))
+
+(deftest child-inherits-parent-selection-without-arg
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        requests (atom [])
+        parent (make-parent roots requests {:skills ["demo"]})]
+    (try
+      (let [child (spawn-and-join parent {"task" "child work"})]
+        (is (= ["demo"] (mapv :skill_id (:skill_evidence @child))))
+        (is (some #(str/includes? % "Demo procedure.") (system-texts requests))))
+      (finally (agent/close-session! parent)))))
+
+(deftest explicit-selection-overrides-inheritance
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        _ (write-skill! (:project roots) "other" "Other procedure.")
+        requests (atom [])
+        parent (make-parent roots requests {:skills ["demo"]})]
+    (try
+      (let [child (spawn-and-join parent {"task" "other work" "skills" ["other"]})]
+        (is (= ["other"] (mapv :skill_id (:skill_evidence @child))))
+        (is (some #(str/includes? % "Other procedure.") (system-texts requests)))
+        (is (not-any? #(str/includes? % "Demo procedure.") (system-texts requests))))
+      (finally (agent/close-session! parent)))))
+
+(deftest invalid-selection-type-is-rejected-before-spawn
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        requests (atom [])
+        parent (make-parent roots requests {:skills ["demo"]})]
+    (try
+      (doseq [bad ["demo" ["ok" 42] {"id" "demo"}]]
+        (let [err (try (agent/spawn-subagent! parent {"task" "x" "skills" bad})
+                       (catch Object e e))]
+          (is (= :invalid-subagent-skills (:category (ex-data err)))
+              (str "selection: " (pr-str bad)))))
+      (finally (agent/close-session! parent)))))
+
+(deftest unknown-skill-fails-closed-without-registering-child
+  (let [roots (make-roots)
+        requests (atom [])
+        parent (make-parent roots requests)
+        before (count (:subagents @parent))
+        err (try (agent/spawn-subagent! parent {"task" "x" "skills" ["ghost"]})
+                 (catch Object e e))]
+    (try
+      (is (= :skill-not-found (:category (ex-data err))))
+      (is (= before (count (:subagents @parent))))
+      (finally (agent/close-session! parent)))))
+
+(deftest child-skill-options-override-and-inherit
+  (let [parent (atom {:config {:skills ["demo"]}
+                      :skill_approvals {"demo" {:winning-root "project"}}
+                      :skill_roots {:project-root "/p" :user-root "/u"}})]
+    (testing "explicit selection overrides, approvals and roots follow"
+      (is (= {:skills ["other"]
+              :skill_approvals {"demo" {:winning-root "project"}}
+              :project_skills_root "/p"
+              :user_skills_root "/u"}
+             (agent/child-skill-options parent ["other"]))))
+    (testing "nil inherits the parent selection"
+      (is (= ["demo"] (:skills (agent/child-skill-options parent nil)))))
+    (testing "explicit empty selects nothing"
+      (is (= {} (agent/child-skill-options parent []))))))
+
+(deftest explicit-empty-selects-nothing-end-to-end
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        requests (atom [])
+        parent (make-parent roots requests {:skills ["demo"]})]
+    (try
+      (let [child (spawn-and-join parent {"task" "bare work" "skills" []})]
+        (is (= [] (:skill_evidence @child)))
+        (is (not-any? #(str/includes? % "Demo procedure.") (system-texts requests))))
+      (finally (agent/close-session! parent)))))
+
+(deftest malformed-ids-fail-closed-at-documented-layers
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        requests (atom [])
+        parent (make-parent roots requests)]
+    (try
+      (testing "blank ids rejected at child layer"
+        (let [err (try (agent/spawn-subagent! parent {"task" "x" "skills" [""]})
+                       (catch Object e e))]
+          (is (= :invalid-subagent-skills (:category (ex-data err))))))
+      (testing "grammar violations rejected pre-read by loader"
+        (doseq [bad [["../x"] ["Demo"] ["a/b"]]]
+          (let [err (try (agent/spawn-subagent! parent {"task" "x" "skills" bad})
+                         (catch Object e e))]
+            (is (= :skill-selection-invalid (:category (ex-data err)))
+                (str "selection: " (pr-str bad))))))
+      (testing "duplicate ids rejected by loader"
+        (let [err (try (agent/spawn-subagent! parent {"task" "x" "skills" ["demo" "demo"]})
+                       (catch Object e e))]
+          (is (= :skill-selection-invalid (:category (ex-data err))))
+          (is (= :duplicate-selected-id (:reason (ex-data err))))))
+      (finally (agent/close-session! parent)))))
+
+(deftest child-evidence-records-revision-and-root
+  (let [roots (make-roots)
+        _ (write-skill! (:project roots) "demo" "Demo procedure.")
+        requests (atom [])
+        parent (make-parent roots requests)]
+    (try
+      (let [child (spawn-and-join parent {"task" "demo work" "skills" ["demo"]})
+            evidence (first (:skill_evidence @child))]
+        (is (= "2026-09-14" (:revision evidence)))
+        (is (= "project" (:root evidence)))
+        (is (= 64 (count (:manifest-digest evidence)))))
+      (finally (agent/close-session! parent)))))

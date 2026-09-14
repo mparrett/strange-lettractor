@@ -1295,18 +1295,34 @@
     (with-session-lock parent #(admit-subagent-run! parent agent-id input))))
 
 (defn child-skill-options
-  "Skill options a subagent child inherits so its selected context matches
-   the parent's: the same selected ids, sticky approvals, and resolved
-   roots. The child's own load evidence describes the child context.
-   Returns {} when the parent selected no skills."
-  [parent]
-  (let [selected (vec (or (get-in @parent [:config :skills]) []))]
-    (if (empty? selected)
-      {}
-      {:skills selected
-       :skill_approvals (or (:skill_approvals @parent) {})
-       :project_skills_root (get-in @parent [:skill_roots :project-root])
-       :user_skills_root (get-in @parent [:skill_roots :user-root])})))
+  "Skill options for a subagent child. With no requested selection the
+   child inherits the parent selection; an explicit vector overrides it
+   (empty selects nothing). Approvals and resolved roots always follow
+   the parent. Non-vector or non-string selections throw
+   :invalid-subagent-skills before any loading. The child's own load
+   evidence describes the child context. Returns {} when nothing is
+   selected."
+  [parent & [requested-skills]]
+  (let [valid-selection? (fn [ids]
+                           (and (sequential? ids)
+                                (every? (fn [id]
+                                          (and (string? id)
+                                               (not (str/blank? id))))
+                                        ids)))]
+    (when (some? requested-skills)
+      (when-not (valid-selection? requested-skills)
+        (throw (ex-info "Subagent skills must be a vector of skill id strings"
+                        {:category :invalid-subagent-skills
+                         :skills requested-skills}))))
+    (let [selected (if (nil? requested-skills)
+                     (vec (or (get-in @parent [:config :skills]) []))
+                     (vec requested-skills))]
+      (if (empty? selected)
+        {}
+        {:skills selected
+         :skill_approvals (or (:skill_approvals @parent) {})
+         :project_skills_root (get-in @parent [:skill_roots :project-root])
+         :user_skills_root (get-in @parent [:skill_roots :user-root])}))))
 
 (defn spawn-subagent! [parent arguments]
   (with-session-lock parent #(parent-open! parent))
@@ -1359,7 +1375,7 @@
                               {:type :subagent_event
                                :agent_id child-id
                                :event event}))) }
-              (child-skill-options parent)))
+              (child-skill-options parent (subagent-arg arguments "skills"))))
           agent-id (:id @child)]
       (let [admission
             (try
@@ -1408,9 +1424,10 @@
   (let [registry (get-in @session [:provider_profile :tool_registry])
         tools
         [(subagent-tool
-           "spawn_agent" "Spawn a scoped coding subagent"
+           "spawn_agent" "Spawn a scoped coding subagent with optional skill selection"
            {:task {:type "string"} :working_dir {:type "string"}
-            :model {:type "string"} :max_turns {:type "integer"}}
+            :model {:type "string"} :max_turns {:type "integer"}
+            :skills {:type "array" :items {:type "string"}}}
            ["task"]
            (fn [arguments _] (spawn-subagent! session arguments)))
          (subagent-tool
