@@ -1,0 +1,2 @@
+# Let-go sources are a Clojure-dialect Lisp, not Go.
+*.lg linguist-language=Clojure
