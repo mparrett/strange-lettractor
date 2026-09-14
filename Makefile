@@ -71,6 +71,9 @@ live-parity: check-runtime ## Live coding-agent parity matrix against ATTRACTOR_
 live-smoke: check-runtime ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
 	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
 
+live-mcp-pilot: check-runtime ## Live MCP pilot (Robinhood trading): needs RH_MCP_TOKEN handoff, exits 2 without it
+	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run
+
 providers: build ## Show the effective provider registry
 	bin/attractor providers
 

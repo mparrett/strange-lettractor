@@ -16,6 +16,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
+            [http :as http]
             [io :as io]
             [os :as os]
             [json :as json]))
@@ -127,10 +128,31 @@
     (fail! :mcp-manifest-invalid {:server_id id :reason :missing-field :field field}))
   manifest)
 
+(defn- stdio-transport? [manifest]
+  (contains? #{:stdio "stdio"} (:transport manifest)))
+
 (defn- check-transport! [manifest id]
   (let [transport (:transport manifest)]
-    (when-not (or (= :streamable-http transport) (= "streamable-http" transport))
-      (fail! :mcp-manifest-invalid {:server_id id :reason :transport-must-be-streamable-http})))
+    (when-not (contains? #{:streamable-http "streamable-http" :stdio "stdio"} transport)
+      (fail! :mcp-manifest-invalid {:server_id id :reason :transport-must-be-streamable-http-or-stdio})))
+  manifest)
+
+(defn- check-endpoint! [manifest id]
+  (if (stdio-transport? manifest)
+    (when (some? (:endpoint manifest))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :endpoint-forbidden-for-stdio}))
+    (when-not (endpoint-ok? (:endpoint manifest))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :endpoint-must-be-https-or-loopback})))
+  manifest)
+
+(defn- check-command! [manifest id]
+  (if (stdio-transport? manifest)
+    (when-not (and (vector? (:command manifest))
+                   (seq (:command manifest))
+                   (every? non-blank-string? (:command manifest)))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :stdio-needs-command-vector}))
+    (when (some? (:command manifest))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :command-forbidden-for-http})))
   manifest)
 
 (defn- check-collections! [manifest id]
@@ -166,9 +188,30 @@
       (fail! :mcp-manifest-invalid {:server_id id :reason :limits-must-bound-timeout-and-bytes})))
   manifest)
 
+(defn- check-oauth-absent! [manifest id key]
+  (when (some? (get manifest key))
+    (fail! :mcp-manifest-invalid {:server_id id :reason :oauth-fields-forbidden-for-stdio
+                                 :field key}))
+  manifest)
+
+(defn- check-stdio-credentials! [manifest id]
+  (when (some? (:token-env manifest))
+    (when-not (non-blank-string? (:token-env manifest))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :token-env-must-be-a-name})))
+  (when (some? (:env manifest))
+    (fail! :mcp-manifest-invalid {:server_id id :reason :env-not-supported-use-process-inheritance}))
+  (doseq [key [:refresh-token-env :token-endpoint :registration-endpoint :registration :scope :authorization-endpoint]]
+    (check-oauth-absent! manifest id key))
+  manifest)
+
 (defn- check-credentials! [manifest id]
-  (when-not (non-blank-string? (:token-env manifest))
-    (fail! :mcp-manifest-invalid {:server_id id :reason :token-env-required}))
+  (if (stdio-transport? manifest)
+    (check-stdio-credentials! manifest id)
+    (when-not (non-blank-string? (:token-env manifest))
+      (fail! :mcp-manifest-invalid {:server_id id :reason :token-env-required})))
+  manifest)
+
+(defn- check-refresh! [manifest id]
   (when (some? (:refresh-token-env manifest))
     (when-not (non-blank-string? (:refresh-token-env manifest))
       (fail! :mcp-manifest-invalid {:server_id id :reason :refresh-token-env-must-be-a-name}))
@@ -189,8 +232,8 @@
   (doseq [field [:revision :name :description]]
     (check-required-string! manifest id field))
   (check-transport! manifest id)
-  (when-not (endpoint-ok? (:endpoint manifest))
-    (fail! :mcp-manifest-invalid {:server_id id :reason :endpoint-must-be-https-or-loopback}))
+  (check-endpoint! manifest id)
+  (check-command! manifest id)
   (check-collections! manifest id)
   (check-task-types! manifest id)
   (check-limits! manifest id)
@@ -338,7 +381,9 @@
                         {:id id
                          :revision (str (:revision manifest))
                          :description (:description manifest)
-                         :endpoint (str (:endpoint manifest))
+                         :endpoint (when (:endpoint manifest) (str (:endpoint manifest)))
+                         :command (:command manifest)
+                         :stdio (contains? #{:stdio "stdio"} (:transport manifest))
                          :manifest-digest (hash/sha256 text)
                          :root root-name}))))
                 (catch Object _ nil)))
@@ -367,9 +412,10 @@
   (if (empty? discovered)
     "(no MCP servers declared)"
     (str/join "\n"
-              (mapv (fn [{:keys [id revision description endpoint root manifest-digest]}]
+              (mapv (fn [{:keys [id revision description endpoint command stdio root manifest-digest]}]
                       (str "  " id " @ " revision " [" root "]\n"
-                           "    endpoint: " endpoint "\n"
+                           "    endpoint: " (or endpoint (str "stdio: " (str/join " " (or command [])))) "\n"
+                           "    inherits: " (if stdio "process environment (operator consent via selection)" "n/a (remote server)") "\n"
                            "    digest:   " (or manifest-digest "(unverified)") "\n"
                            "    " description))
                     discovered))))
@@ -377,26 +423,33 @@
 (defn authorize-guidance
   "Pure operator guidance for the manual token handoff. Names the
    authorization endpoint and scope from the manifest; the harness never
-   handles token values."
+   handles token values. stdio servers are local subprocesses: no browser
+   step, tokens (if any) flow from process inheritance."
   [manifest]
-  (let [endpoint (str (:endpoint manifest))
-        lines ["Complete the browser authorization step out of band, then place"
-               "the resulting tokens in the OS keychain or process environment."
-               "Nothing credential-shaped belongs in the repo, configs, or logs."
-               (str "  server:                " (:id manifest))
-               (str "  endpoint:              " endpoint)]]
+  (if (contains? #{:stdio "stdio"} (:transport manifest))
     (str/join "\n"
-              (cond-> lines
-                (non-blank-string? (:authorization-endpoint manifest))
-                (conj (str "  authorization endpoint: " (:authorization-endpoint manifest)))
-                (non-blank-string? (:scope manifest))
-                (conj (str "  scope:                  " (:scope manifest)))
+              (cond-> [(str "  server:  " (:id manifest))
+                       "Local subprocess server: no browser authorization step."
+                       "Declared tokens flow from process inheritance;"
+                       "export them before launching attractor."]
                 (non-blank-string? (:token-env manifest))
-                (conj (str "  export " (:token-env manifest) "=<access-token>"))
-                (non-blank-string? (:refresh-token-env manifest))
-                (conj (str "  export " (:refresh-token-env manifest) "=<refresh-token>"))))))
+                (conj (str "  export " (:token-env manifest) "=<token>"))))
+    (let [lines ["Complete the browser authorization step out of band, then place"
+                 "the resulting tokens in the OS keychain or process environment."
+                 "Nothing credential-shaped belongs in the repo, configs, or logs."
+                 (str "  server:                " (:id manifest))
+                 (str "  endpoint:              " (:endpoint manifest))]]
+      (str/join "\n"
+                (cond-> lines
+                  (non-blank-string? (:authorization-endpoint manifest))
+                  (conj (str "  authorization endpoint: " (:authorization-endpoint manifest)))
+                  (non-blank-string? (:scope manifest))
+                  (conj (str "  scope:                  " (:scope manifest)))
+                  (non-blank-string? (:token-env manifest))
+                  (conj (str "  export " (:token-env manifest) "=<access-token>"))
+                  (non-blank-string? (:refresh-token-env manifest))
+                  (conj (str "  export " (:refresh-token-env manifest) "=<refresh-token>")))))))
 
-;; ---------------------------------------------------------------------------
 ;; Token refresh and dynamic registration (memory only, never persisted).
 ;; ---------------------------------------------------------------------------
 
@@ -428,8 +481,9 @@
    :mcp-auth-failed; nothing is written anywhere."
   [transport token-endpoint client-id refresh-token & [opts]]
   (let [bounds (or opts {})
+        sender (or transport http/request)
         outcome (capacity/call!
-                  (fn [] (transport {:method :post :url token-endpoint
+                  (fn [] (sender {:method :post :url token-endpoint
                                      :headers {"content-type" "application/x-www-form-urlencoded"
                                                "accept" "application/json"}
                                      :body (form-body [["grant_type" "refresh_token"]
@@ -635,11 +689,14 @@
 (defn- admit-one-server [session resolved token-reader transport]
   (let [manifest (:manifest resolved)
         server-id (:id manifest)
-        token ((or token-reader (fn [name] (os/getenv name))) (:token-env manifest))]
-    (when (str/blank? (str token))
+        stdio? (stdio-transport? manifest)
+        token-env (:token-env manifest)
+        reader (or token-reader (fn [name] (os/getenv name)))
+        token (when (non-blank-string? token-env) (reader token-env))]
+    (when (and (non-blank-string? token-env) (str/blank? (str token)))
       (fail! :mcp-auth-missing {:server_id server-id
-                               :token_env (:token-env manifest)
-                               :hint (str "export " (:token-env manifest)
+                               :token_env token-env
+                               :hint (str "export " token-env
                                           " with a handoff token; values never enter the repo")}))
     (let [registry (get-in @session [:provider_profile :tool_registry])
           _ (when (nil? registry)
@@ -652,16 +709,31 @@
       (doseq [tool-name all-names]
         (when (profiles/registry-get registry tool-name)
           (fail! :mcp-tool-collision {:server_id server-id :tool tool-name})))
-      (let [handle (mcp-client/open-session
-                     {:transport transport
-                      :endpoint (:endpoint manifest)
-                      :timeout-ms (get-in manifest [:limits :timeout-ms])
-                      :aborted? (fn [] (boolean (:abort_signaled @session)))
-                      :headers (auth-headers token)})
+      (let [aborted? (fn [] (boolean (:abort_signaled @session)))
+            timeout-ms (get-in manifest [:limits :timeout-ms])
+            handle (if stdio?
+                     (try
+                       (mcp-client/open-session
+                         {:command (:command manifest)
+                          :timeout-ms timeout-ms
+                          :aborted? aborted?})
+                       (catch Object error
+                         (fail! :mcp-unavailable {:server_id server-id
+                                                 :reason :spawn-failed
+                                                 :cause (ex-message error)})))
+                     (mcp-client/open-session
+                       {:transport transport
+                        :endpoint (:endpoint manifest)
+                        :timeout-ms timeout-ms
+                        :aborted? aborted?
+                        :headers (auth-headers token)}))
             server-ctx {:manifest manifest
                         :manifest-digest (:manifest-digest resolved)
-                        :timeout-ms (get-in manifest [:limits :timeout-ms])
-                        :aborted? (fn [] (boolean (:abort_signaled @session)))
+                        :transport-kind (if stdio? :stdio :streamable-http)
+                        :timeout-ms timeout-ms
+                        :aborted? aborted?
+                        :server-pid (when stdio? (mcp-client/server-pid handle 2000))
+                        :env-inheritance (when stdio? "process")
                         :root (:root resolved)
                         :cross-root (:cross-root resolved)
                         :loser-digest (:loser-digest resolved)
@@ -713,6 +785,9 @@
                     :cross-root (:cross-root resolved)
                     :loser-digest (:loser-digest resolved)
                     :endpoint (:endpoint manifest)
+                    :command (:command manifest)
+                    :transport (if stdio? :stdio :streamable-http)
+                    :server-pid (:server-pid server-ctx)
                     :tools (mapv :name tool-entries)
                     :resources (mapv :uri (:resources manifest))
                     :token-source (:token-env manifest)

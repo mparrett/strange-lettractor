@@ -49,7 +49,16 @@
                 (recur))
               (if exited-before-read
                 (do (framing/finish! decoder)
-                    (reset! (:eof transport) true))
+                    (reset! (:eof transport) true)
+                    ;; EOF outside an orderly close means the child died:
+                    ;; fail pending calls fast instead of hanging to timeout.
+                    (report-failure!
+                      transport
+                      (ex-info "Child process exited while transport open"
+                               {:category :codex-transport
+                                :kind :child-exited
+                                :exit_code (try (some-> (read-file-trim exit-file) parse-long)
+                                                (catch Object _ nil))})))
                 (do (core/sleep 5) (recur)))))))
       (catch Object e (report-failure! transport e))
       (finally (io/close! reader)))))
@@ -102,10 +111,25 @@
         (> (System/currentTimeMillis) deadline) false
         :else (do (core/sleep 10) (recur))))))
 
+(defn- numeric-pid? [value]
+  (and (some? value) (boolean (re-matches #"[0-9]+" (str value)))))
+
+(defn- kill-tree!
+  "Signal the child's current children (first-level descendants) so forking
+   servers do not orphan grandchildren when only the exact PID is killed.
+   pkill exits nonzero on no match; that never fails the close path.
+   PIDs are validated numeric to avoid matching unrelated processes."
+  [child-pid signal]
+  (when (numeric-pid? child-pid)
+    (try (os/sh "/usr/bin/pkill" (str "-" signal) "-P" (str child-pid))
+         (catch Object _ nil)))
+  nil)
+
 (defn close!
   "Close stdin, give the child :shutdown-ms to exit, then TERM and KILL its
-   exact PID. Joins the shell and reader, removes the temporary files, and
-   returns {:closed? true :reaped? bool :exit_code n|nil}."
+   exact PID plus its current children (no orphaned grandchildren). Joins
+   the shell and reader, removes the temporary files, and returns
+   {:closed? true :reaped? bool :exit_code n|nil}."
   [transport]
   (or @(:closed transport)
       (do
@@ -114,9 +138,11 @@
         (let [ms (:shutdown-ms transport)
               child-pid (pid transport)
               exited (or (await-exit transport ms)
-                         (do (when child-pid (os/sh "/bin/kill" "-TERM" (str child-pid)))
+                         (do (kill-tree! child-pid "TERM")
+                             (when child-pid (os/sh "/bin/kill" "-TERM" (str child-pid)))
                              (await-exit transport ms))
-                         (do (when child-pid (os/sh "/bin/kill" "-KILL" (str child-pid)))
+                         (do (kill-tree! child-pid "KILL")
+                             (when child-pid (os/sh "/bin/kill" "-KILL" (str child-pid)))
                              (await-exit transport ms)))
               _ (deref (:shell transport) (+ ms 1000) nil)
               _ (deref (:reader transport) (+ ms 1000) nil)

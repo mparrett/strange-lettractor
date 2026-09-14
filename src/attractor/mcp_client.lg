@@ -15,8 +15,10 @@
    timeout plus an optional abort poll through capacity/call!, whose worker
    errors stay redacted. Empty or malformed successes fail closed; a
    transport-level throw means :mcp-unavailable, never empty data."
-  (:require [attractor.context-discovery :as capacity]
+  (:require [attractor.codex.transport :as codex.transport]
+            [attractor.context-discovery :as capacity]
             [attractor.llm :as llm]
+            [clojure.core :as core]
             [clojure.string :as str]
             [http :as http]
             [json :as json]))
@@ -26,6 +28,158 @@
 
 (defn- fail! [category data]
   (throw (ex-info (str "MCP: " (name category)) (assoc data :category category))))
+
+(defn- non-blank-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
+;; stdio transport: owned subprocess, newline-delimited JSON-RPC.
+;; ---------------------------------------------------------------------------
+;; The child is launched through the owned codex duplex transport
+;; (exact-PID management, FIFO plus files, reader future, TERM/KILL
+;; reaping). stdin/stdout carry JSONL frames, stderr is logs only and is
+;; never parsed. The server MUST NOT send requests: any server request is
+;; answered method-not-found and counted. Cancellation goes out as
+;; notifications/cancelled. Responses correlate by request id; unknown or
+;; late ids are ignored and counted, never failed.
+
+(defn- real-open-transport [{:keys [command on-message on-failure max-frame-bytes shutdown-ms]}]
+  (let [link (codex.transport/open! {:command command
+                                     :on-message on-message
+                                     :on-failure on-failure
+                                     :max-frame-bytes max-frame-bytes
+                                     :shutdown-ms shutdown-ms})]
+    {:send (fn [message] (codex.transport/send! link message))
+     :close (fn [] (codex.transport/close! link))
+     :pid (fn [] (try (codex.transport/pid link) (catch Object _ nil)))}))
+
+(defn- fail-stdio-pending! [handle reason]
+  (let [state @handle
+        waiting (vals @(:pending state))]
+    (reset! (:pending state) {})
+    (doseq [box (map :deliver waiting)]
+      (try (deliver box {:transport-failed true :reason reason})
+           (catch Object _ nil)))))
+
+(defn- dispatch-stdio-message! [handle message]
+  (swap! (:stats @handle) update :received inc)
+  (cond (and (map? message) (contains? message "id") (contains? message "method"))
+        (do (swap! (:stats @handle) update :server-requests-rejected inc)
+            (try ((:send (:link @handle))
+                  {"jsonrpc" "2.0" "id" (get message "id")
+                                     "error" {"code" -32601
+                                              "message" "server-to-client requests are not supported"}})
+                 (catch Object _ nil)))
+
+        (and (map? message) (contains? message "id"))
+        (let [key (str (get message "id"))
+              waiting (get @(:pending @handle) key)]
+          (if (nil? waiting)
+            (swap! (:stats @handle) update :stale inc)
+            (do (swap! (:pending @handle) dissoc key)
+                (deliver (:deliver waiting) message))))
+
+        (and (map? message) (contains? message "method"))
+        (swap! (:stats @handle) update :notifications inc)
+
+        :else
+        (swap! (:stats @handle) update :malformed inc)))
+
+(defn- send-cancelled! [handle request-id]
+  (try
+    ((:send (:link @handle))
+     {"jsonrpc" "2.0" "method" "notifications/cancelled"
+                        "params" {"requestId" request-id}})
+    (catch Object _ nil))
+  nil)
+
+(defn- await-stdio-response! [handle request-id box]
+  (let [state @handle
+        timeout-ms (or (:timeout-ms state) default-timeout-ms)
+        aborted? (:aborted? state)
+        deadline (+ (System/currentTimeMillis) timeout-ms)
+        pending-key (str request-id)
+        waiting ::stdio-waiting]
+    (loop []
+      (let [value (deref box 50 waiting)]
+        (cond (not= value waiting)
+              (if (and (map? value) (:transport-failed value))
+                (fail! :mcp-unavailable {:reason (:reason value)})
+                value)
+
+              (and (some? aborted?) (aborted?))
+              (do (send-cancelled! handle request-id)
+                  (swap! (:pending @handle) dissoc pending-key)
+                  (fail! :mcp-cancelled {}))
+
+              (>= (System/currentTimeMillis) deadline)
+              (do (send-cancelled! handle request-id)
+                  (swap! (:pending @handle) dissoc pending-key)
+                  (fail! :mcp-timeout {:timeout-ms timeout-ms}))
+
+              :else (recur))))))
+
+(defn- stdio-request! [handle method params]
+  (let [state @handle
+        request-id (swap! (:next-id state) inc)
+        box (core/promise)
+        _ (swap! (:pending state) assoc (str request-id) {:deliver box})
+        _ (swap! (:stats state) update :sent inc)]
+    (try
+      ((:send (:link state))
+       {"jsonrpc" "2.0" "id" request-id
+                          "method" method "params" (or params {})})
+      (catch Object error
+        (swap! (:pending state) dissoc (str request-id))
+        (fail! :mcp-unavailable {:reason :stdio-send-failed})))
+    (let [response (await-stdio-response! handle request-id box)]
+      (cond (and (map? response) (contains? response "result"))
+            {:result (get response "result")}
+
+            (and (map? response) (contains? response "error"))
+            (fail! :mcp-remote-error {:code (get-in response ["error" "code"])
+                                     :message (get-in response ["error" "message"])})
+
+            :else
+            (fail! :mcp-protocol-error {:reason :stdio-neither-result-nor-error})))))
+
+(defn- open-stdio-session! [opts]
+  (let [{:keys [command timeout-ms aborted? max-frame-bytes shutdown-ms open-transport]} (or opts {})
+        _ (when-not (and (vector? command) (seq command)
+                         (every? non-blank-string? command))
+            (fail! :mcp-configuration {:reason :command-must-be-non-empty-strings}))
+        opener (or open-transport real-open-transport)
+        handle (atom {:mode :stdio
+                      :timeout-ms (or timeout-ms default-timeout-ms)
+                      :aborted? aborted?
+                      :pending (atom {})
+                      :stats (atom {:sent 0 :received 0 :server-requests-rejected 0
+                                    :notifications 0 :malformed 0 :stale 0})
+                      :next-id (atom 0)})
+        link (try
+               (opener {:command command
+                        :max-frame-bytes (or max-frame-bytes 1048576)
+                        :shutdown-ms (or shutdown-ms 2000)
+                        :on-message (fn [message] (dispatch-stdio-message! handle message))
+                        :on-failure (fn [error] (fail-stdio-pending! handle error))})
+               (catch Object error
+                 (fail! :mcp-unavailable {:reason :spawn-failed})))]
+    (swap! handle assoc :link link)
+    handle))
+
+(defn server-pid
+  "Exact child PID of a stdio handle, or nil when unknown. With
+   wait-ms, polls briefly because the shell echoes $! asynchronously
+   after spawn."
+  [handle & [wait-ms]]
+  (let [state (when (some? handle) @handle)]
+    (when (= :stdio (:mode state))
+      (let [read-pid (fn [] (try ((:pid (:link state))) (catch Object _ nil)))
+            deadline (+ (System/currentTimeMillis) (or wait-ms 0))]
+        (loop [pid (read-pid)]
+          (if (or (some? pid) (>= (System/currentTimeMillis) deadline))
+            pid
+            (do (core/sleep 25)
+                (recur (read-pid)))))))))
 
 (defn- header-value [headers name]
   (let [wanted (str/lower-case (str name))]
@@ -129,20 +283,28 @@
     nil))
 
 (defn open-session
-  "Open a client handle (an atom). Modern mode needs no handshake: the
-   handle starts stateless and upgrades to legacy on first fallback.
-   opts: :transport, :endpoint (required), :timeout-ms, :aborted?,
-   :headers (merged into every request, used for authorization)."
+  "Open a client handle (an atom). Streamable HTTP mode takes :endpoint
+   (modern, stateless; upgrades to legacy on first fallback). stdio mode
+   takes :command (owned subprocess); both together is a configuration
+   error. Common opts: :transport (HTTP) or :open-transport (stdio),
+   :timeout-ms, :aborted?, :headers (HTTP authorization)."
   [opts]
-  (let [{:keys [transport endpoint timeout-ms aborted? headers]} (or opts {})]
-    (when (str/blank? (str endpoint))
-      (fail! :mcp-configuration {:reason :endpoint-required}))
-    (atom {:transport transport :endpoint endpoint
-           :timeout-ms (or timeout-ms default-timeout-ms)
-           :aborted? aborted?
-           :headers (or headers {})
-           :mode :modern :session-id nil
-           :next-id (atom 0)})))
+  (let [{:keys [transport endpoint timeout-ms aborted? headers command]} (or opts {})]
+    (cond (some? command)
+          (do (when (some? endpoint)
+                (fail! :mcp-configuration {:reason :command-and-endpoint-exclusive}))
+              (open-stdio-session! opts))
+
+          (str/blank? (str endpoint))
+          (fail! :mcp-configuration {:reason :endpoint-required})
+
+          :else
+          (atom {:transport transport :endpoint endpoint
+                 :timeout-ms (or timeout-ms default-timeout-ms)
+                 :aborted? aborted?
+                 :headers (or headers {})
+                 :mode :modern :session-id nil
+                 :next-id (atom 0)}))))
 
 (defn set-headers!
   "Replace the extra headers merged into every request (used for token
@@ -178,8 +340,10 @@
    or unrecognized body, the handle handshakes once and retries with the
    legacy session id. Modern JSON-RPC errors never trigger the fallback."
   [handle method params]
-  (try
-    (assoc (post-request handle method params) :mode (:mode @handle))
+  (if (= :stdio (:mode @handle))
+    (assoc (stdio-request! handle method params) :mode :stdio)
+    (try
+      (assoc (post-request handle method params) :mode (:mode @handle))
     (catch Object error
       (when-not (= :mcp-legacy-fallback-required (:category (ex-data error)))
         (throw error))
@@ -187,20 +351,29 @@
         (fail! :mcp-transport-error {:url (:endpoint @handle)
                                     :reason :legacy-retry-rejected}))
       (do-handshake! handle)
-      (assoc (post-request handle method params) :mode (:mode @handle)))))
+      (assoc (post-request handle method params) :mode (:mode @handle))))))
 
 (defn close-session!
-  "Best-effort teardown. Legacy handles issue DELETE with the session id;
-   modern handles hold no server state, so closing is a local no-op.
-   Teardown failures are swallowed: server-side expiry is the backstop."
+  "Best-effort teardown. Legacy handles issue DELETE with the session
+   id; stdio handles terminate the owned child (exact PID) and fail any
+   in-flight calls; modern handles hold no server state, so closing is a
+   local no-op. Teardown failures are swallowed: server-side expiry is
+   the backstop."
   [handle]
   (let [state (when (some? handle) @handle)]
-    (when (and (= :legacy (:mode state)) (not (str/blank? (str (:session-id state)))))
-      (try
-        (let [transport (or (:transport state) http/request)]
-          (transport {:method :delete :url (:endpoint state)
-                      :headers (assoc (:headers state)
-                                      "mcp-session-id" (:session-id state))
-                      :body ""}))
-        (catch Object _ nil))))
-  nil)
+    (cond (= :stdio (:mode state))
+          (do (fail-stdio-pending! handle :closing)
+              (try ((:close (:link state)))
+                   (catch Object _ {:closed? false})))
+
+          (and (= :legacy (:mode state)) (not (str/blank? (str (:session-id state)))))
+          (try
+            (let [transport (or (:transport state) http/request)]
+              (transport {:method :delete :url (:endpoint state)
+                          :headers (assoc (:headers state)
+                                          "mcp-session-id" (:session-id state))
+                          :body ""}))
+            (catch Object _ nil))))
+)
+
+;; ---------------------------------------------------------------------------

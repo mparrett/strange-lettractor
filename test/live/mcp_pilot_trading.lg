@@ -1,0 +1,130 @@
+(ns main
+  "SCN-MCP-PILOT-TRADING: live handshake + refresh proof against the
+   Robinhood MCP pilot (https://agent.robinhood.com/mcp/trading).
+
+   BLOCKED BY DEFAULT: the pilot needs an operator token handoff
+   (RH_MCP_TOKEN, optionally RH_MCP_REFRESH_TOKEN + RH_MCP_CLIENT_ID).
+   Without RH_MCP_TOKEN it prints handoff instructions and exits 2
+   without touching the network. Nothing credential-shaped is persisted:
+   evidence carries digests and redacted metadata only.
+
+   Usage:
+     lg -source-paths src:test test/live/mcp_pilot_trading.lg run [--tool NAME --args JSON]
+
+   With --tool, the pilot additionally calls the explicitly named tool.
+   Name a read-only tool only; the pilot cannot verify server-side
+   side effects. Evidence lands in evidence/mcp-pilot-trading-evidence.edn
+   (or ATTRACTOR_PILOT_EVIDENCE)."
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            [os :as os] [io :as io] [json :as json]
+            [attractor.mcp-client :as mcp-client]
+            [attractor.mcp :as mcp]
+            [attractor.providers :as providers]
+            [hash :as hash]))
+
+(def endpoint "https://agent.robinhood.com/mcp/trading")
+(def token-endpoint "https://api.robinhood.com/oauth2/token/")
+(def evidence-path "evidence/mcp-pilot-trading-evidence.edn")
+
+(defn- env [key]
+  (let [value (os/getenv key)]
+    (when-not (str/blank? value) value)))
+
+(defn- handoff-and-exit! []
+  (println "MCP pilot blocked: no operator token handoff.")
+  (println "Steps:")
+  (println "  1. Complete the browser OAuth authorization-code + PKCE step out of band")
+  (println "     (scope: internal; public client via dynamic registration).")
+  (println "  2. export RH_MCP_TOKEN=<access-token>")
+  (println "     optionally export RH_MCP_REFRESH_TOKEN=<refresh-token> RH_MCP_CLIENT_ID=<client-id>")
+  (println "     for the refresh proof (token endpoint shown above).")
+  (println "  3. Re-run this pilot. Tokens stay in process memory only.")
+  (println "Nothing was sent over the network.")
+  (os/exit 2))
+
+(defn- find-arg-val [args flag]
+  (loop [remaining args]
+    (cond (empty? remaining) nil
+          (= (first remaining) flag) (second remaining)
+          :else (recur (rest remaining)))))
+
+(defn- handshake-journey [token]
+  (let [started (System/currentTimeMillis)
+        handle (mcp-client/open-session
+                 {:endpoint endpoint :timeout-ms 20000
+                  :headers {"authorization" (str "Bearer " token)}})]
+    (try
+      (let [listed (mcp-client/session-request! handle "tools/list" {})
+            tools (get (:result listed) "tools")]
+        {:status :pass
+         :mode (:mode listed)
+         :tool-count (count tools)
+         :tool-names (mapv #(get % "name") tools)
+         :duration-ms (- (System/currentTimeMillis) started)})
+      (finally (mcp-client/close-session! handle)))))
+
+(defn- tool-journey [token tool-name args-json]
+  (let [handle (mcp-client/open-session
+                 {:endpoint endpoint :timeout-ms 20000
+                  :headers {"authorization" (str "Bearer " token)}})]
+    (try
+      (let [arguments (if (str/blank? (or args-json ""))
+                        {}
+                        (json/read-json args-json))
+            out (mcp-client/session-request!
+                  handle "tools/call" {:name tool-name :arguments arguments})
+            text (mcp/extract-text (:result out))]
+        {:status :pass :tool tool-name
+         :result-digest (hash/sha256 text)
+         :result-bytes (count (bytes text))})
+      (finally (mcp-client/close-session! handle)))))
+
+(defn- refresh-journey [refresh-token client-id]
+  (if (or (str/blank? refresh-token) (str/blank? client-id))
+    {:status :skipped :reason :refresh-unconfigured}
+    (let [fresh (mcp/refresh-access-token nil token-endpoint client-id refresh-token
+                                          {:timeout-ms 20000})]
+      {:status (if (and (map? fresh)
+                        (not (str/blank? (:access-token fresh))))
+                 :pass :fail)
+       :expires-in (:expires-in fresh)})))
+
+(defn- run-row [name f]
+  (let [started (System/currentTimeMillis)]
+    (try (merge {:journey name} (f))
+         (catch Object error
+           {:journey name :status :fail
+            :category (:category (ex-data error))
+            :duration-ms (- (System/currentTimeMillis) started)}))))
+
+(defn -main [& args]
+  (let [token (env "RH_MCP_TOKEN")]
+    (when (nil? token)
+      (handoff-and-exit!))
+    (let [rows [(run-row :handshake (fn [] (handshake-journey token)))
+                (run-row :refresh (fn [] (refresh-journey (env "RH_MCP_REFRESH_TOKEN")
+                                                          (env "RH_MCP_CLIENT_ID"))))]
+          tool-name (find-arg-val args "--tool")
+          rows (if (str/blank? (or tool-name ""))
+                 rows
+                 (conj rows (run-row :tool-call
+                                     (fn [] (tool-journey token tool-name
+                                                          (find-arg-val args "--args"))))))
+          evidence {:scenario "SCN-MCP-PILOT-TRADING"
+                    :recorded_at (str (System/currentTimeMillis))
+                    :endpoint endpoint
+                    :rows rows}
+          redacted (providers/redact evidence [(env "RH_MCP_TOKEN")
+                                                (env "RH_MCP_REFRESH_TOKEN")])]
+      (io/mkdir "evidence")
+      (io/spit (or (env "ATTRACTOR_PILOT_EVIDENCE") evidence-path) (pr-str redacted))
+      (doseq [row rows] (prn (dissoc row :detail)))
+      (let [failed (filter #(= :fail (:status %)) rows)]
+        (prn {:journeys (count rows)
+              :passed (count (filter #(= :pass (:status %)) rows))
+              :skipped (count (filter #(= :skipped (:status %)) rows))
+              :failed (count failed)})
+        (os/exit (if (seq failed) 1 0))))))
+
+(when *command-line-args* (apply -main *command-line-args*))

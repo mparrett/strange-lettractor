@@ -1,0 +1,180 @@
+(ns attractor.mcp-stdio-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [json :as json]
+            [io :as io]
+            [os :as os]
+            [attractor.mcp-client :as mcp-client]))
+
+(def fixture-server (str (os/cwd) "/test/fixtures/mcp_stdio_server.py"))
+
+(defn- open-stdio [command & [opts]]
+  (mcp-client/open-session (merge {:command command :timeout-ms 5000} opts)))
+
+(deftest spawned-server-has-an-exact-pid
+  (let [handle (open-stdio ["/bin/cat"])]
+    (try
+      (let [pid (mcp-client/server-pid handle)]
+        (is (integer? pid))
+        (is (pos? pid)))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest echo-envelope-never-succeeds
+  ;; cat echoes our envelope (rejected as server-shaped) and then echoes
+   ;; our own rejection reply, which surfaces as a remote error. Either
+   ;; way the echo never resolves into a fabricated success.
+  (let [handle (open-stdio ["/bin/cat"] {:timeout-ms 300})
+        err (try (mcp-client/session-request! handle "ping" {})
+                 (catch Object e e))]
+    (try
+      (is (contains? #{:mcp-remote-error :mcp-timeout} (:category (ex-data err))))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest fixture-server-handshake-lists-and-calls
+  (let [handle (open-stdio ["/usr/bin/python3" fixture-server])
+        init (mcp-client/session-request!
+               handle "initialize"
+               {:protocolVersion "2026-07-28" :capabilities {}
+                :clientInfo {:name "attractor" :version "0"}})]
+    (try
+      (is (= "fixture" (get-in init [:result "serverInfo" "name"])))
+      (let [listed (mcp-client/session-request! handle "tools/list" {})]
+        (is (= ["quote"] (mapv #(get % "name") (get (:result listed) "tools"))))
+        (let [called (mcp-client/session-request!
+                       handle "tools/call"
+                       {:name "quote" :arguments {:symbol "AAA"}})]
+          (is (str/includes? (get-in called [:result "content" 0 "text"] "missing") "AAA"))))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest hung-server-times-out-and-cancels
+  (let [handle (open-stdio ["/bin/sh" "-c" "read line; sleep 30"] {:timeout-ms 300})
+        err (try (mcp-client/session-request! handle "tools/list" {})
+                 (catch Object e e))]
+    (try
+      (is (= :mcp-timeout (:category (ex-data err))))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest pre-aborted-call-cancels-fast
+  (let [handle (open-stdio ["/bin/sh" "-c" "read line; sleep 30"]
+                           {:timeout-ms 5000 :aborted? (fn [] true)})
+        t0 (System/currentTimeMillis)
+        err (try (mcp-client/session-request! handle "tools/list" {})
+                 (catch Object e e))]
+    (try
+      (is (= :mcp-cancelled (:category (ex-data err))))
+      (is (< (- (System/currentTimeMillis) t0) 4000))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest server-requests-are-rejected-not-executed
+  (let [handle (open-stdio ["/usr/bin/python3" fixture-server "--emit-request"])
+        out (mcp-client/session-request! handle "tools/list" {})]
+    (try
+      (is (some? (:result out)))
+      (is (= 1 (:server-requests-rejected @(:stats @handle))))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest missing-command-fails-closed
+  (let [err (try (mcp-client/open-session {:command [] :timeout-ms 100})
+                 (catch Object e e))]
+    (is (= :mcp-configuration (:category (ex-data err))))))
+
+(deftest dead-server-call-fails-unavailable
+  (let [handle (open-stdio ["/bin/cat"])]
+    (mcp-client/close-session! handle)
+    (let [err (try (mcp-client/session-request! handle "ping" {})
+                   (catch Object e e))]
+      (is (= :mcp-unavailable (:category (ex-data err)))))))
+
+(deftest kill-mid-call-fails-fast-unavailable
+  (let [handle (open-stdio ["/bin/sh" "-c" "read line; sleep 30"] {:timeout-ms 30000})
+        fut (core/future
+              (try (mcp-client/session-request! handle "tools/list" {})
+                   (catch Object e e)))]
+    (core/sleep 500)
+    (let [pid (mcp-client/server-pid handle)]
+      (is (pos? pid))
+      (os/sh "/bin/kill" "-KILL" (str pid))
+      (let [t0 (System/currentTimeMillis)
+            result (deref fut 15000 :timeout)]
+        (try
+          (is (not= :timeout result))
+          (is (= :mcp-unavailable (:category (ex-data result))))
+          (is (< (- (System/currentTimeMillis) t0) 8000))
+          (finally (mcp-client/close-session! handle)))))))
+
+(deftest close-reaps-first-level-grandchildren
+  (let [handle (open-stdio ["/bin/sh" "-c" "sleep 30 & wait"] {:timeout-ms 5000})
+        sh-pid (mcp-client/server-pid handle)
+        children-of (fn [pid]
+                      (let [out (try (os/sh "/usr/bin/pgrep" "-P" (str pid))
+                                     (catch Object _ {:exit 1}))]
+                        (if (= 0 (:exit out)) (:out out) "")))]
+    (try
+      (is (pos? sh-pid))
+      (let [deadline (+ (System/currentTimeMillis) 5000)]
+        (loop []
+          (when (and (str/blank? (children-of sh-pid))
+                     (< (System/currentTimeMillis) deadline))
+            (core/sleep 100)
+            (recur)))
+        (is (not (str/blank? (children-of sh-pid)))))
+      (finally (mcp-client/close-session! handle)))
+    (is (str/blank? (children-of sh-pid)))))
+
+(deftest concurrent-calls-correlate-by-id
+  (let [handle (open-stdio ["/usr/bin/python3" fixture-server] {:timeout-ms 8000})
+        run (fn [symbol]
+              (core/future
+                (try (mcp-client/session-request!
+                       handle "tools/call" {:name "quote" :arguments {:symbol symbol}})
+                     (catch Object e e))))]
+    (try
+      (let [results (mapv #(deref % 15000 :timeout) (mapv run ["a" "b" "c" "d" "e"]))]
+        (is (= 5 (count results)))
+        (doseq [[symbol result] (map vector ["a" "b" "c" "d" "e"] results)]
+          (is (str/includes? (get-in result [:result "content" 0 "text"] "missing") symbol))))
+      (finally (mcp-client/close-session! handle)))))
+
+(deftest double-close-is-idempotent
+  (let [handle (open-stdio ["/bin/cat"])]
+    (let [first-close (mcp-client/close-session! handle)
+          second-close (mcp-client/close-session! handle)]
+      (is (true? (:closed? first-close)))
+      (is (= first-close second-close)))))
+
+(deftest spawn-failure-maps-to-unavailable
+  (let [err (try (mcp-client/open-session
+                   {:command ["x"]
+                    :open-transport (fn [_] (throw (ex-info "boom" {})))})
+                 (catch Object e e))]
+    (is (= :mcp-unavailable (:category (ex-data err))))
+    (is (= :spawn-failed (:reason (ex-data err))))))
+
+(deftest injected-transport-drives-counters
+  (let [hooks (atom nil)
+        received (atom [])
+        fake-open (fn [{:keys [on-message on-failure]}]
+                    (reset! hooks {:on-message on-message :on-failure on-failure})
+                    {:send (fn [message] (swap! received conj message) nil)
+                     :close (fn [] {:closed? true})
+                     :pid (fn [] 4242)})
+        handle (mcp-client/open-session {:command ["fake"] :open-transport fake-open
+                                         :timeout-ms 500})
+        emit (:on-message @hooks)]
+    (try
+      (emit {"jsonrpc" "2.0" "id" 999 "result" {}})
+      (emit {"jsonrpc" "2.0" "method" "ping"})
+      (emit "not-a-map")
+      (emit {"jsonrpc" "2.0" "id" 7 "method" "roots/list"})
+      (let [stats @(:stats @handle)]
+        (is (= 1 (:stale stats)))
+        (is (= 1 (:notifications stats)))
+        (is (= 1 (:malformed stats)))
+        (is (= 1 (:server-requests-rejected stats)))
+        (is (= 4 (:received stats))))
+      (let [reply (last @received)]
+        (is (= 7 (get reply "id")))
+        (is (= -32601 (get-in reply ["error" "code"]))))
+      (is (= 4242 (mcp-client/server-pid handle)))
+      (finally (mcp-client/close-session! handle)))))

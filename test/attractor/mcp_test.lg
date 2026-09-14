@@ -557,3 +557,124 @@
         out (mcp/refresh-access-token transport "https://api.example/t" "cid" "a/b+c@d e")]
     (is (= "n" (:access-token out)))
     (is (str/includes? @seen "refresh_token=a%2Fb%2Bc%40d%20e"))))
+
+;; ---------------------------------------------------------------------------
+;; stdio transport: manifest shapes, admission, owned-process calls.
+;; ---------------------------------------------------------------------------
+
+(defn- stdio-manifest [id command & [extra]]
+  (merge {:id id :revision "2026-09-14" :name (str "Server " id)
+          :description (str "Serves " id)
+          :transport :stdio :command command
+          :tools [{:name "quote" :description "Get a quote"
+                   :class :pure-tool :side-effects :none
+                   :schema {:type "object" :properties {:symbol {:type "string"}}}}]
+          :resources []
+          :task-types ["research"]
+          :limits {:timeout-ms 15000 :max-bytes 8192}
+          :provenance {:operator "test" :license "MIT"}}
+         extra))
+
+(def stdio-fixture [(str (os/cwd) "/test/fixtures/mcp_stdio_server.py")])
+
+(deftest stdio-manifest-shape-rules
+  (let [roots (make-roots)]
+    (doseq [[label manifest]
+            [["endpoint-forbidden"
+              (assoc (stdio-manifest "demo" stdio-fixture) :endpoint "https://m.example/mcp")]
+             ["env-forbidden"
+              (assoc (stdio-manifest "demo" stdio-fixture) :env {"FOO" "bar"})]
+             ["refresh-forbidden"
+              (assoc (stdio-manifest "demo" stdio-fixture)
+                     :refresh-token-env "T" :token-endpoint "https://api.example/t" :client-id "c")]
+             ["empty-command"
+              (assoc (stdio-manifest "demo" stdio-fixture) :command [])]
+             ["blank-command-entry"
+              (assoc (stdio-manifest "demo" stdio-fixture) :command [""])]
+             ["command-forbidden-for-http"
+              (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                     :command ["x"])]]]
+      (write-manifest! (:project roots) "demo" manifest)
+      (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                         (base-opts roots (fn [_] {}) (fn [_] "tok")))
+                     (catch Object e e))]
+        (is (= :mcp-manifest-invalid (:category (ex-data err))) (str "case: " label))))))
+
+(deftest stdio-admission-spawns-owned-process-with-pid-evidence
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (stdio-manifest "demo" (into ["/usr/bin/python3"] stdio-fixture)))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] (throw (ex-info "stdio needs no HTTP" {})))
+                    (fn [_] nil))]
+      (try
+        (let [server (first (:mcp_servers @session))]
+          (is (= :stdio (:transport server)))
+          (is (integer? (:server-pid server)))
+          (is (pos? (:server-pid server)))
+          (is (some? (profiles/registry-get
+                       (get-in @session [:provider_profile :tool_registry])
+                       "demo__quote"))))
+        (finally (agent/close-session! session))))))
+
+(deftest stdio-tool-call-round-trips-through-child
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (stdio-manifest "demo" (into ["/usr/bin/python3"] stdio-fixture)))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] (throw (ex-info "stdio needs no HTTP" {})))
+                    (fn [_] nil))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)
+              entry (last @(:mcp_evidence @session))]
+          (is (str/includes? output "price 42 for AAA"))
+          (is (str/includes? output "externally-supplied"))
+          (is (= "demo" (:server entry)))
+          (is (false? (:truncated entry))))
+        (finally (agent/close-session! session))))))
+
+(deftest stdio-token-env-handoff-checked-at-admission
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (stdio-manifest "demo" ["/bin/cat"]) :token-env "MCP_TEST_TOKEN"))
+    (testing "missing token fails closed without spawning"
+      (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
+                                         (base-opts roots (fn [_] {}) (fn [_] nil)))
+                     (catch Object e e))]
+        (is (= :mcp-auth-missing (:category (ex-data err))))))
+    (testing "present token admits"
+      (let [requests (atom [])
+            session (make-session-with-mcp
+                      roots requests ["demo"]
+                      (fn [_] (throw (ex-info "no HTTP" {})))
+                      (fn [_] "handoff-token"))]
+        (try
+          (is (= ["demo"] (mapv :server_id (:mcp_servers @session))))
+          (finally (agent/close-session! session)))))))
+
+(deftest dead-binary-admits-then-fails-fast-on-first-call
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (stdio-manifest "demo" ["/nonexistent-binary-xyz"]))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (fn [_] (throw (ex-info "no HTTP" {})))
+                    (fn [_] nil))]
+      (try
+        ;; Admission succeeds (eager spawn tolerates immediate child death);
+        ;; the first call fails fast, never hangs to timeout.
+        (is (= ["demo"] (mapv :server_id (:mcp_servers @session))))
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              t0 (System/currentTimeMillis)
+              err (try ((:executor tool) {:symbol "AAA"} nil) (catch Object e e))]
+          (is (= :mcp-unavailable (:category (ex-data err))))
+          (is (< (- (System/currentTimeMillis) t0) 10000)))
+        (finally (agent/close-session! session))))))
