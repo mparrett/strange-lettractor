@@ -16,6 +16,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
+            [clojure.core :as core]
             [http :as http]
             [io :as io]
             [os :as os]
@@ -238,6 +239,7 @@
   (check-task-types! manifest id)
   (check-limits! manifest id)
   (check-credentials! manifest id)
+  (check-refresh! manifest id)
   (when (some? (:registration-endpoint manifest))
     (when-not (and (non-blank-string? (:registration-endpoint manifest))
                    (str/starts-with? (str (:registration-endpoint manifest)) "https://"))
@@ -597,9 +599,40 @@
    "content-type" "application/json"
    "accept" "application/json, text/event-stream"})
 
-(defn- try-refresh [server-ctx]
-  "Attempt one refresh using the live refresh token. Returns the fresh
-   access token or throws :mcp-auth-failed."
+(def expiry-leeway-ms
+  "Refresh ahead of tracked expiry by this margin so server-side clock
+   skew cannot turn a fresh token stale mid-call."
+  30000)
+
+(defn- track-token!
+  "Record a live access token and its optional expiry in the per-server
+   token state. expires-in-secs may be nil (unknown expiry: reuse until
+   a 401 says otherwise). Values stay in this atom only, never in logs."
+  [server-ctx token expires-in-secs]
+  (let [expires-at (when (integer? expires-in-secs)
+                     (+ (System/currentTimeMillis) (* 1000 (max 0 expires-in-secs))))]
+    (reset! (:token-state server-ctx) {:token token :expires-at-ms expires-at}))
+  token)
+
+(defn- refresh-configured? [server-ctx]
+  (let [manifest (:manifest server-ctx)]
+    (and (non-blank-string? (:refresh-token-env manifest))
+         (non-blank-string? (:token-endpoint manifest))
+         (some? (:token-reader server-ctx)))))
+
+(defn- with-refresh-lock! [server-ctx f]
+  "Serialize token refresh per server so concurrent expiries single-flight:
+   the winner refreshes once while the rest wait, then re-check."
+  (let [lock (:refresh-lock server-ctx)]
+    (loop []
+      (if (compare-and-set! lock false true)
+        (try (f) (finally (reset! lock false)))
+        (do (core/sleep 5)
+            (recur))))))
+
+(defn- try-refresh-locked! [server-ctx]
+  "Refresh body; caller must hold the server refresh lock so headers
+   and token state update atomically with respect to other refreshers."
   (let [manifest (:manifest server-ctx)
         reader (:token-reader server-ctx)
         refresh-token (when reader (reader (:refresh-token-env manifest)))]
@@ -613,8 +646,40 @@
                                        :aborted? (:aborted? server-ctx)})]
       (mcp-client/set-headers! (:handle server-ctx)
                                (auth-headers (:access-token fresh)))
+      (track-token! server-ctx (:access-token fresh) (:expires-in fresh))
       (:access-token fresh))))
 
+
+(defn- try-refresh [server-ctx]
+  "Attempt one refresh using the live refresh token. Serialized per
+   server. Returns the fresh access token or throws :mcp-auth-failed."
+  (with-refresh-lock! server-ctx (fn [] (try-refresh-locked! server-ctx))))
+
+(defn- token-expired? [server-ctx]
+  (let [{:keys [expires-at-ms]} @(:token-state server-ctx)]
+    (boolean (and (some? expires-at-ms)
+                  (refresh-configured? server-ctx)
+                  (>= (System/currentTimeMillis) (- expires-at-ms expiry-leeway-ms))))))
+
+(defn- ensure-fresh-token! [server-ctx]
+  "Return {:reused bool}. Fast path reuses the cached token. A possibly
+   expired token takes the refresh lock and re-checks inside, so
+   concurrent expiries single-flight to exactly one refresh. Without a
+   tracked expiry the token is reused until a 401 says otherwise.
+   Without refresh configuration an expired token is used as-is and
+   left to fail closed."
+  [server-ctx]
+  (let [token-env (:token-env (:manifest server-ctx))]
+    (if-not (non-blank-string? token-env)
+      {:reused true}
+      (if-not (token-expired? server-ctx)
+        {:reused true}
+        (with-refresh-lock! server-ctx
+          (fn []
+            (if (token-expired? server-ctx)
+              (do (try-refresh-locked! server-ctx)
+                  {:reused false})
+              {:reused true})))))))
 (defn- refreshable? [server-ctx error]
   (and (= :mcp-auth-failed (:category (ex-data error)))
        (non-blank-string? (:refresh-token-env (:manifest server-ctx)))
@@ -632,20 +697,28 @@
         max-bytes (get-in manifest [:limits :max-bytes])
         request-id (ids/prefixed "mcp")
         t0 (System/currentTimeMillis)
+        refreshed-this-call (atom false)
         outcome (try
-                  {:status :ok
-                   :response (mcp-client/session-request!
-                               (:handle server-ctx) method params)}
-                  (catch Object error
-                    (if (refreshable? server-ctx error)
+                  (let [freshness (ensure-fresh-token! server-ctx)]
+                    (assoc
                       (try
-                        (try-refresh server-ctx)
                         {:status :ok
                          :response (mcp-client/session-request!
                                      (:handle server-ctx) method params)}
-                        (catch Object refresh-error
-                          {:status :error :error refresh-error}))
-                      {:status :error :error error})))
+                        (catch Object error
+                          (if (refreshable? server-ctx error)
+                            (try
+                              (try-refresh server-ctx)
+                              (reset! refreshed-this-call true)
+                              {:status :ok
+                               :response (mcp-client/session-request!
+                                           (:handle server-ctx) method params)}
+                              (catch Object refresh-error
+                                {:status :error :error refresh-error}))
+                            {:status :error :error error})))
+                      :freshness freshness))
+                  (catch Object error
+                    {:status :error :error error :freshness {:reused false}}))
         received-at (System/currentTimeMillis)
         base {:request-id request-id
               :server server-id
@@ -654,7 +727,10 @@
               :manifest-digest (:manifest-digest server-ctx)
               :args-digest (hash/sha256 (pr-str params))
               :timeout-ms (get-in manifest [:limits :timeout-ms])
-              :token-source (:token-env manifest)
+                     :token-source (:token-env manifest)
+                     :token-reused (boolean (and (:reused (:freshness outcome))
+                                              (not @refreshed-this-call)))
+                     :token-expires-at (:expires-at-ms @(:token-state server-ctx))
               :received-at received-at
               :latency-ms (- received-at t0)}]
     (if (= :ok (:status outcome))
@@ -729,6 +805,8 @@
                         :headers (auth-headers token)}))
             server-ctx {:manifest manifest
                         :manifest-digest (:manifest-digest resolved)
+                        :token-state (atom {:token token :expires-at-ms nil})
+                        :refresh-lock (atom false)
                         :transport-kind (if stdio? :stdio :streamable-http)
                         :timeout-ms timeout-ms
                         :aborted? aborted?

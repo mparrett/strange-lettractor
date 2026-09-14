@@ -78,6 +78,9 @@
   (try (get (json/read-json (str (:body request))) "id")
        (catch Object _ 1)))
 
+(defn- call-echo [request text]
+  (rpc-result (request-id request) {:content [{:type "text" :text text}]}))
+
 (defn- json-transport [calls body & [status]]
   (fn [request]
     (swap! calls conj request)
@@ -100,7 +103,10 @@
               (manifest-for "demo" "http://m.example/mcp" [(query-tool)])]
              ["missing-token"
               (dissoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
-                      :token-env)]]]
+                      :token-env)]
+             ["refresh-without-endpoint"
+              (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                     :refresh-token-env "T")]]]
       (write-manifest! (:project roots) "demo" manifest)
       (let [err (try (mcp/admit-servers! (atom {:id "s" :mcp_evidence (atom [])}) ["demo"]
                                          (base-opts roots (fn [_] {:status 200 :headers {} :body "{}"})
@@ -677,4 +683,158 @@
               err (try ((:executor tool) {:symbol "AAA"} nil) (catch Object e e))]
           (is (= :mcp-unavailable (:category (ex-data err))))
           (is (< (- (System/currentTimeMillis) t0) 10000)))
+        (finally (agent/close-session! session))))))
+
+;; ---------------------------------------------------------------------------
+;; Standing requirement: tokens cached per server, reused until expiry.
+;; ---------------------------------------------------------------------------
+
+(deftest access-token-reused-across-calls-without-reacquire
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (manifest-for "demo" "https://m.example/mcp" [(query-tool)]))
+    (let [reads (atom [])
+          reader (fn [name] (swap! reads conj name) "tok-1")
+          auths (atom [])
+          transport (fn [request]
+                      (swap! auths conj (get (:headers request) "authorization"))
+                      {:status 200 :headers {"content-type" "application/json"}
+                       :body (rpc-result (request-id request)
+                                         {:content [{:type "text" :text "ok"}]})})
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport reader)]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          ((:executor tool) {:symbol "AAA"} nil)
+          ((:executor tool) {:symbol "BBB"} nil)
+          (is (= ["Bearer tok-1" "Bearer tok-1"] @auths))
+          ;; Token read once at admission, never re-acquired per call.
+          (is (= ["MCP_TEST_TOKEN"] @reads))
+          (let [entries @(:mcp_evidence @session)]
+            (is (= 2 (count entries)))
+            (is (every? #(true? (:token-reused %)) entries))
+            (is (every? #(nil? (:token-expires-at %)) entries))))
+        (finally (agent/close-session! session))))))
+
+(deftest tracked-expiry-refreshes-proactively-without-401
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [token-hits (atom 0)
+          status-401 (atom 0)
+          transport (fn [request]
+                      (let [url (:url request)]
+                        (cond (str/includes? url "oauth2/token")
+                              (do (swap! token-hits inc)
+                                  {:status 200 :headers {"content-type" "application/json"}
+                                   :body (json/write-json {:access_token (str "tok-" @token-hits)
+                                                           :expires_in -1})})
+                              (= "Bearer tok-stale" (get (:headers request) "authorization"))
+                              (do (swap! status-401 inc)
+                                  {:status 401 :headers {} :body "expired"})
+                              :else
+                              {:status 200 :headers {"content-type" "application/json"}
+                               :body (call-echo request "ok")})))
+          tokens {"MCP_TEST_TOKEN" "tok-stale" "MCP_TEST_REFRESH" "tok-refresh"}
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport #(get tokens %))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          ;; Call 1: stale token, single 401, refresh (expires immediately).
+          ((:executor tool) {:symbol "AAA"} nil)
+          ;; Call 2: tracked expiry forces proactive refresh, no new 401.
+          ((:executor tool) {:symbol "BBB"} nil)
+          (is (= 1 @status-401))
+          (is (= 2 @token-hits))
+          (let [entries @(:mcp_evidence @session)
+                second-entry (second entries)]
+            (is (false? (:token-reused second-entry)))
+            (is (some? (:token-expires-at second-entry)))))
+        (finally (agent/close-session! session))))))
+
+(deftest proactive-refresh-failure-still-audits
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [mode (atom :seed-expired)
+          transport (fn [request]
+                      (let [url (:url request)]
+                        (cond (str/includes? url "oauth2/token")
+                              (if (= :seed-expired @mode)
+                                {:status 200 :headers {"content-type" "application/json"}
+                                 :body (json/write-json {:access_token "tok-1" :expires_in -1})}
+                                (throw (ex-info "token endpoint down" {})))
+                              (= "Bearer tok-stale" (get (:headers request) "authorization"))
+                              {:status 401 :headers {} :body "expired"}
+                              :else
+                              {:status 200 :headers {"content-type" "application/json"}
+                               :body (call-echo request "ok")})))
+          tokens {"MCP_TEST_TOKEN" "tok-stale" "MCP_TEST_REFRESH" "tok-refresh"}
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport #(get tokens %))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          ((:executor tool) {:symbol "AAA"} nil)
+          (reset! mode :endpoint-down)
+          (let [err (try ((:executor tool) {:symbol "BBB"} nil) (catch Object e e))]
+            (is (= :mcp-auth-failed (:category (ex-data err))))
+            (let [entries @(:mcp_evidence @session)]
+              (is (= 2 (count entries)))
+              (let [second-entry (second entries)]
+                (is (= :error (:status second-entry)))
+                (is (false? (:token-reused second-entry)))
+                (is (= :mcp-auth-failed (:error-category second-entry)))))))
+        (finally (agent/close-session! session))))))
+
+(deftest concurrent-expiry-refreshes-exactly-once
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [token-hits (atom 0)
+          transport (fn [request]
+                      (let [url (:url request)]
+                        (cond (str/includes? url "oauth2/token")
+                              (let [n (swap! token-hits inc)]
+                                {:status 200 :headers {"content-type" "application/json"}
+                                 :body (json/write-json {:access_token (str "tok-" n)
+                                                         :expires_in (if (= 1 n) -1 3600)})})
+                              (= "Bearer tok-stale" (get (:headers request) "authorization"))
+                              {:status 401 :headers {} :body "expired"}
+                              :else
+                              {:status 200 :headers {"content-type" "application/json"}
+                               :body (call-echo request "ok")})))
+          tokens {"MCP_TEST_TOKEN" "tok-stale" "MCP_TEST_REFRESH" "tok-refresh"}
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport #(get tokens %))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          ;; Seed tracked expiry: one 401-driven refresh that expires at once.
+          ((:executor tool) {:symbol "seed"} nil)
+          (is (= 1 @token-hits))
+          (let [futures (mapv (fn [n]
+                                (core/future
+                                  (try ((:executor tool) {:symbol (str "c" n)} nil)
+                                       (catch Object e e))))
+                              [1 2 3 4 5])
+                results (mapv #(deref % 15000 :timeout) futures)]
+            (is (every? string? results))
+            (is (= 2 @token-hits))
+            (is (= 6 (count @(:mcp_evidence @session))))))
         (finally (agent/close-session! session))))))
