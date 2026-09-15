@@ -1,0 +1,2 @@
+(defn handle-exit [_node _context _graph _logs-root]
+  {:status :success :notes "Exit node"})
