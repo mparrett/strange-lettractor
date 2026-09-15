@@ -1,0 +1,122 @@
+(ns attractor.tools
+  (:require [clojure.string :as str]
+            [io :as io]
+            [os :as os]))
+
+;; Truncation and tool functions extracted from attractor.agent.
+;; agent.lg requires this namespace and delegates.
+
+(def default-tool-output-limits
+  {"read_file" 50000
+   "shell" 30000
+   "execute_command" 30000
+   "grep" 20000
+   "glob" 20000
+   "directory_list" 20000
+   "edit_file" 10000
+   "apply_patch" 10000
+   "write_file" 1000
+   "spawn_agent" 20000})
+
+(def default-tool-line-limits
+  {"shell" 256
+   "execute_command" 256
+   "grep" 200
+   "glob" 500
+   "directory_list" 500})
+
+(def head-tail-tools
+  #{"read_file" "shell" "execute_command" "spawn_agent"})
+
+(defn truncate-output [output max-chars mode]
+  (let [text (str (or output ""))
+        limit (max 0 (or max-chars (count text)))]
+    (if (<= (count text) limit)
+      text
+      (let [removed (- (count text) limit)]
+        (if (= mode "head_tail")
+          (let [head-size (quot limit 2)
+                tail-size (- limit head-size)]
+            (str (subs text 0 head-size)
+                 "\n\n[WARNING: Tool output was truncated. " removed
+                 " characters were removed from the middle. "
+                 "The full output is available in the event stream. "
+                 "If you need to see specific parts, re-run the tool with more targeted parameters.]\n\n"
+                 (subs text (- (count text) tail-size))))
+          (str "[WARNING: Tool output was truncated. First " removed
+               " characters were removed. The full output is available in the event stream.]\n\n"
+               (subs text (- (count text) limit))))))))
+
+(defn truncate-lines [output max-lines]
+  (let [text (str (or output ""))
+        lines (vec (str/split text #"\n"))
+        limit (or max-lines (count lines))]
+    (if (or (nil? max-lines) (<= (count lines) limit))
+      text
+      (let [head-count (quot limit 2)
+            tail-count (- limit head-count)
+            omitted (- (count lines) limit)]
+        (str (str/join "\n" (subvec lines 0 head-count))
+             "\n[... " omitted " lines omitted ...]\n"
+             (str/join "\n" (subvec lines (- (count lines) tail-count))))))))
+
+(defn truncate-tool-output [output tool-name config]
+  (let [configured-char-limits (or (:tool_output_limits config) {})
+        configured-line-limits (or (:tool_line_limits config) {})
+        max-chars (or (get configured-char-limits tool-name)
+                      (get default-tool-output-limits tool-name)
+                      20000)
+        max-lines (if (contains? configured-line-limits tool-name)
+                    (get configured-line-limits tool-name)
+                    (get default-tool-line-limits tool-name))
+        mode (if (contains? head-tail-tools tool-name) "head_tail" "tail")]
+    (truncate-lines (truncate-output output max-chars mode) max-lines)))
+
+;; Tool definitions
+(defn tool-read-file [path & [start-line end-line]]
+  (try
+    (let [content (io/slurp path)]
+      (if (or start-line end-line)
+        (let [lines (str/split content #"\n")
+              s (max 0 (dec (or start-line 1)))
+              e (min (count lines) (or end-line (count lines)))
+              sliced (subvec (vec lines) s e)]
+          (str/join "\n" sliced))
+        content))
+    (catch Object e
+      (str "Error reading file " path ": " e))))
+
+(defn tool-write-file [path content]
+  (try
+    (io/spit path content)
+    (str "Successfully wrote to " path)
+    (catch Object e
+      (str "Error writing file " path ": " e))))
+
+(defn tool-edit-file [path old-string new-string]
+  (try
+    (let [content (io/slurp path)]
+      (if (str/includes? content old-string)
+        (let [updated (str/replace-first content old-string new-string)]
+          (io/spit path updated)
+          (str "Successfully edited " path))
+        (str "Error: old_string not found in " path)))
+    (catch Object e
+      (str "Error editing file " path ": " e))))
+
+(defn tool-execute-command [cmd & [timeout-ms]]
+  (try
+    (let [args (str/split (str/trim cmd) #"\s+")
+          res (apply os/sh args)]
+      {:exit (:exit res)
+       :stdout (:out res)
+       :stderr (:err res)})
+    (catch Object e
+      {:exit 1 :stdout "" :stderr (str "Execution error: " e)})))
+
+(defn tool-directory-list [dir]
+  (try
+    (let [entries (os/ls (or dir "."))]
+      (str/join "\n" (map (fn [e] (str (if (:dir? e) "[DIR]  " "[FILE] ") (:name e))) entries)))
+    (catch Object e
+      (str "Error listing directory " dir ": " e))))
