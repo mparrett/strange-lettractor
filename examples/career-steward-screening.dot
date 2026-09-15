@@ -1,0 +1,53 @@
+digraph ScreeningPipeline {
+  graph [
+    goal="Screen a job opportunity: evaluate fit, gather evidence, and produce a qualification packet before human decision."
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+
+  load_opportunity [shape=box, label="Load opportunity", prompt="Load the opportunity from the pipeline row or inbound source. Extract company, role, level, location, compensation range, working model, interview format, and role scope."]
+  gather_evidence [shape=box, label="Gather evidence", prompt="Search private wiki, career memory, and prior pipeline records for relevant context: past contacts at company, prior applications, salary benchmarks, industry notes."]
+  evidence_complete [shape=tripleoctagon, label="Evidence gathered"]
+
+  qualification_needed [shape=diamond, label="Enough info\nto qualify?"]
+  request_info [shape=hexagon, label="Request info from\nprincipal", type="wait.human"]
+  info_available [shape=diamond, label="Info\nprovided?"]
+
+  fit_analysis [shape=box, label="Analyze fit", prompt="Compare the role requirements against the principal's career evidence. Score fit on: level match, compensation alignment, location/remote feasibility, required skills, growth vector. Produce a qualification summary with confidence level."]
+
+  rate_opportunity [shape=box, label="Rate opportunity", prompt="Assignment the opportunity to a pipeline state: new-lead, qualification-needed, resume-requested, scheduling-needed, booked-prep, assessment, interview-loop, awaiting-counterpart, or closed. Set a priority."]
+  produce_packet [shape=box, label="Produce packet", prompt="Using interview-prep-packet, build a target packet with: role thesis, likely evaluation criteria, matching evidence, risk areas, questions to ask, follow-up notes, and resume-variant checklist if needed."]
+
+  present_to_principal [shape=hexagon, label="Present to principal", type="wait.human"]
+  principal_decision [shape=diamond, label="Proceed?"]
+  advance_pipeline [shape=box, label="Advance pipeline", prompt="Record the decision, update pipeline state, company page, contact page, and throughput ledger. Generate next-action draft if proceeding."]
+  close_opportunity [shape=box, label="Close opportunity", prompt="Record the decision, archive the pipeline row, note the reason, and update the throughput ledger."]
+
+  exit [shape=Msquare, label="Exit"]
+
+  // Flow
+  start -> load_opportunity
+  load_opportunity -> gather_evidence
+  gather_evidence -> evidence_complete
+
+  evidence_complete -> qualification_needed
+  qualification_needed -> request_info [label="Missing critical data"]
+  qualification_needed -> fit_analysis [label="Sufficient"]
+
+  request_info -> info_available
+  info_available -> fit_analysis [label="Provided"]
+  info_available -> close_opportunity [label="Withdrawn or stalled"]
+  info_available -> request_info [label="Still insufficient\nRequest again"]
+
+  fit_analysis -> rate_opportunity
+  rate_opportunity -> produce_packet
+  produce_packet -> present_to_principal
+
+  present_to_principal -> principal_decision
+  principal_decision -> advance_pipeline [label="Proceed"]
+  principal_decision -> close_opportunity [label="Pass or discard"]
+  principal_decision -> present_to_principal [label="Request more info\nRework packet"]
+
+  advance_pipeline -> exit
+  close_opportunity -> exit
+}

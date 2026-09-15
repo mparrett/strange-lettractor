@@ -1,0 +1,37 @@
+digraph ContentInbound {
+  graph [
+    goal="Convert private proof-of-work, interview learnings, and agent-system work into approval-gated public-safe article/post drafts."
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+
+  backlog [shape=box, label="Backlog scan", prompt="Scan the article-fodder-backlog from private wiki, career memory, and recent work artifacts for topics worth developing."]
+  select_topic [shape=hexagon, label="Select topic", type="wait.human"]
+
+  gather_source [shape=box, label="Gather source material", prompt="Collect private notes, transcripts, debriefs, and evidence related to the selected topic. Tag each item with its classification: public-safe, private-with-redaction, or forbidden."]
+  redact [shape=box, label="Redact private content", prompt="Using content-safety-redaction, convert private evidence into generalized lessons, paraphrases, or sanitized examples. Remove raw transcripts, private names, local paths, credentials, unreleased counterpart details, and private third-party quotes."]
+  draft_article [shape=box, label="Draft article", prompt="Using approval-gated-correspondence, draft the article in the principal's voice with source attribution preserved privately. Include enough context for approval without re-reading the entire source."]
+
+  approval_gate [shape=hexagon, label="Approval gate", type="wait.human"]
+  approval_check [shape=diamond, label="Approved?"]
+  revise [shape=box, label="Revise draft", prompt="Revise the draft based on principal's feedback, keeping the redaction boundary intact."]
+
+  publish [shape=parallelogram, label="Publish", tool_command="publish-public-post"]
+  attribution [shape=box, label="Record attribution", prompt="Record the published artifact link and source attribution privately so the principal can audit where claims came from."]
+
+  exit [shape=Msquare, label="Exit"]
+
+  // Flow
+  start -> backlog
+  backlog -> select_topic
+  select_topic -> gather_source
+  gather_source -> redact
+  redact -> draft_article
+  draft_article -> approval_gate
+  approval_gate -> approval_check
+  approval_check -> revise [label="Request changes"]
+  approval_check -> publish [label="Approved"]
+  revise -> draft_article
+  publish -> attribution
+  attribution -> exit
+}

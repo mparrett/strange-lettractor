@@ -1,0 +1,148 @@
+digraph CareerStewardAgent {
+  graph [
+    goal="Steward the principal's career by triaging opportunities, preserving context, preparing grounded artifacts, and requesting approval before external side effects.",
+    model_stylesheet=".main { llm_provider: openai; llm_model: gpt5; }",
+    skills="career-opportunity-triage, approval-gated-correspondence, interview-prep-packet, pipeline-state-stewardship, content-safety-redaction"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+
+  // ─── Phase 1: Multi-source intake ──────────────────────────────
+  intake [shape=component, label="Read all inbound sources", join_policy="wait_all", max_parallel=4]
+    read_email [shape=parallelogram, label="read.email", tool_command="read-gmail-inbox"]
+    read_linkedin [shape=parallelogram, label="inbox.read\nprofile.read", tool_command="read-linkedin-inbox"]
+    read_telegram [shape=parallelogram, label="receive-user-directives", tool_command="read-telegram"]
+    read_whatsapp [shape=parallelogram, label="group-messages.read", tool_command="read-whatsapp-groups"]
+  intake_done [shape=tripleoctagon, label="All sources read"]
+
+  has_inbound [shape=diamond, label="New actionable\ninbound?"]
+  no_inbound [shape=parallelogram, label="Log empty cycle", tool_command="log-empty-cycle", style=dashed]
+
+  // ─── Phase 2: Classify ──────────────────────────────────────────
+  classify [shape=box, class="main", prompt="Using career-opportunity-triage, identify source, company, role, contact, and deadline. Classify the inbound into one decision class and assign the pipeline state."]
+  classify_decision [shape=diamond, label="Decision class?"]
+
+  // ─── Phase 3: Route by classification ──────────────────────────
+  // Each classification routes to a different handling path.
+  // All outcomes write to private state — the distinction is whether
+  // the write creates a pipeline row (tracked opportunity) or not.
+
+  // Noise: write to noise bucket for later pattern analysis
+  update_noise_bucket [shape=parallelogram, label="Store noise\nprivate-wiki/noise", tool_command="write-noise-bucket"]
+
+  // Passive review / application receipt: log-only, no approval needed
+  update_log [shape=parallelogram, label="Log and defer\nprivate-state/log", tool_command="write-pipeline-log"]
+
+  // Closure: update existing pipeline row and close it
+  close_row [shape=box, class="main", prompt="Using pipeline-state-stewardship, close the pipeline row for this opportunity. Record the closure reason, archive the contact and company pages, and update the throughput ledger."]
+
+  // ─── Phase 4: Draft and packet (for actionable items) ──────────
+  // Privacy redaction is applied during drafting, not after external actions.
+  // The content-safety-redaction skill ensures raw third-party content stays private.
+  draft_reply [shape=box, class="main", prompt="Using approval-gated-correspondence and content-safety-redaction, draft a reply in the principal's voice with enough context for approval. Keep exact text stable behind the gate. Never send or schedule as part of drafting."]
+  build_packet [shape=box, class="main", prompt="Using interview-prep-packet, build a target packet with role thesis, evaluation criteria, matching evidence, risk areas, and questions. Keep raw transcripts private."]
+  update_pipeline [shape=box, class="main", prompt="Using pipeline-state-stewardship, create or update the pipeline row for this opportunity. Record source, company, contact, state, classification, evidence pointers, and next action in append-only audit entries. Also update the company-page and contact-page."]
+  draft_packet_pipeline [shape=tripleoctagon, label="Draft, packet,\nand pipeline ready"]
+
+  // ─── Phase 5: Approval gate ─────────────────────────────────────
+  // External side effects (send, publish, create, open PR) require exact-text
+  // approval per policy. Internal writes (pipeline row, packet) do not.
+  approval_gate [shape=hexagon, label="Approve external action", max_retries=3]
+  rework [shape=box, class="main", prompt="Revise the draft based on the principal's feedback. Keep privacy boundaries and voice intact."]
+
+  // ─── Phase 6: Execute approved action ───────────────────────────
+  execute [shape=component, label="Approved action", join_policy="wait_any", max_parallel=1]
+    act_send_email [shape=parallelogram, label="send.email", tool_command="send-email"]
+    act_send_linkedin [shape=parallelogram, label="send.linkedin-message", tool_command="send-linkedin"]
+    act_create_event [shape=parallelogram, label="create.calendar-event", tool_command="create-calendar-event"]
+    act_open_pr [shape=parallelogram, label="open.external-pr", tool_command="open-pr"]
+    act_publish [shape=parallelogram, label="publish.public-post", tool_command="publish-public-post"]
+  action_done [shape=tripleoctagon, label="Action complete"]
+
+  // ─── Phase 7: Finalize ──────────────────────────────────────────
+  update_ledger [shape=box, class="main", prompt="Using pipeline-state-stewardship, update the throughput ledger with the action outcome. Record approval status, action timestamp, and artifact links. Prefer append-only entries."]
+  notify_principal [shape=parallelogram, label="notify.user-telegram", tool_command="notify-telegram"]
+
+  exit [shape=Msquare, label="Exit"]
+
+  // ─── Edges ──────────────────────────────────────────────────────
+  start -> intake
+  intake -> read_email
+  intake -> read_linkedin
+  intake -> read_telegram
+  intake -> read_whatsapp
+
+  read_email -> intake_done
+  read_linkedin -> intake_done
+  read_telegram -> intake_done
+  read_whatsapp -> intake_done
+
+  intake_done -> has_inbound
+  has_inbound -> no_inbound [label="No"]
+  has_inbound -> classify [label="Yes"]
+  no_inbound -> exit [style=dashed]
+
+  classify -> classify_decision
+
+  // — Noise → noise bucket for later harvesting —
+  classify_decision -> update_noise_bucket [label="noise"]
+
+  // — Passive items → log only, no approval —
+  classify_decision -> update_log [label="passive-review"]
+  classify_decision -> update_log [label="application-receipt"]
+
+  // — Closure → update and archive the pipeline row —
+  classify_decision -> close_row [label="closure"]
+
+  // — Actionable items → draft, packet, pipeline, then approval —
+  classify_decision -> draft_reply [label="reply-needed"]
+  classify_decision -> draft_reply [label="scheduling"]
+  classify_decision -> draft_reply [label="resume-needed"]
+  classify_decision -> build_packet [label="prep-only"]
+
+  // Phase 3 destinations
+  update_noise_bucket -> exit
+  update_log -> exit
+  close_row -> exit
+
+  // Phase 4: draft phase — three parallel tracks
+  draft_reply -> draft_packet_pipeline
+  build_packet -> draft_packet_pipeline
+  update_pipeline -> draft_packet_pipeline
+
+  // The pipeline row is written BEFORE approval so the principal
+  // can review context. The throughput ledger is updated AFTER action.
+  // This split matches the original spec's allowedWithoutApproval for
+  // write.private-wiki and write.private-draft.
+  draft_reply -> update_pipeline
+  build_packet -> update_pipeline
+  update_pipeline -> draft_packet_pipeline
+
+  draft_packet_pipeline -> approval_gate
+
+  // Approval gate routes
+  approval_gate -> execute [label="Approve and send"]
+  approval_gate -> execute [label="Approve and publish"]
+  approval_gate -> execute [label="Approve and schedule"]
+  approval_gate -> execute [label="Approve and open PR"]
+  approval_gate -> rework [label="Revise"]
+  approval_gate -> update_ledger [label="Approve internal only"]
+
+  rework -> approval_gate
+
+  // Execute — only the matching sub-node fires
+  execute -> act_send_email
+  execute -> act_send_linkedin
+  execute -> act_create_event
+  execute -> act_open_pr
+  execute -> act_publish
+  act_send_email -> action_done
+  act_send_linkedin -> action_done
+  act_create_event -> action_done
+  act_open_pr -> action_done
+  act_publish -> action_done
+
+  action_done -> update_ledger
+  update_ledger -> notify_principal
+  notify_principal -> exit
+}
