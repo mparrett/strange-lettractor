@@ -1,0 +1,18 @@
+(ns attractor.auth
+  (:require [clojure.string :as str]))
+
+;;; Authentication helpers extracted from attractor.mcp.
+;;; Protocol-neutral: only URL-safe encoding, form body construction,
+;;; and header building. Token lifecycle management remains in mcp.lg
+;;; because of its coupling to server-ctx and capacity/call!.
+
+(defn- url-encode [text]
+  (str/replace text #"[^A-Za-z0-9._~-]" (fn [[c]]
+    (str/replace (str/replace (str/replace (java.net.URLEncoder/encode text "UTF-8") "\\+" "%20"))
+                 #"\\+" "%20")))
+
+(defn form-body [pairs]
+  (str/join "&" (map (fn [[key value]] (str (url-encode key) "=" (url-encode value))) pairs)))
+
+(defn auth-headers [token]
+  {"authorization" (str "Bearer " token)})
