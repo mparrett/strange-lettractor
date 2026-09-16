@@ -140,43 +140,102 @@
      :refresh-token (:refresh_token data)
      :expires-in (:expires_in data)}))
 
+
+(defn- discover-auth-metadata
+  "Discover OAuth endpoints per MCP spec (RFC 9728 + RFC 8414).
+   Returns {:authorization-url :token-url :registration-url :scope}.
+   Falls back to explicit overrides when discovery fails."
+  [transport server-endpoint overrides]
+  (try
+    ;; Step 1: Fetch resource metadata from MCP well-known path (RFC 9728)
+    (let [endpoint-parts (str/split (str/replace server-endpoint "://" "/") #"/")
+          host (second endpoint-parts)
+          path (str/join "/" (drop 2 endpoint-parts))
+          resource-url (str "https://" host "/.well-known/oauth-protected-resource/" path)
+          resource-resp (transport {:method :get :url resource-url :headers {"accept" "application/json"}})
+          resource-data (try (json/read-json (:body resource-resp)) {})
+          auth-servers (:authorization_servers resource-data)]
+      (if (seq auth-servers)
+        ;; Step 2: Fetch authorization server metadata from first server (RFC 8414)
+        (let [issuer (first auth-servers)
+              ;; Try standard RFC 8414 discovery first, then fall back to path-based
+              rfc8414-urls [(str issuer "/.well-known/oauth-authorization-server/")
+                            (str (str/replace issuer (re-pattern (str host ".*")) (str host "/.well-known/oauth-authorization-server/" path)))]]
+          (loop [urls rfc8414-urls]
+            (if (empty? urls)
+              (throw (ex-info "Authorization server metadata not found" {:category :auth-discovery-failed}))
+              (let [resp (transport {:method :get :url (first urls) :headers {"accept" "application/json"}})
+                    data (try (json/read-json (:body resp)) nil)]
+                (if data
+                  {:authorization-url (:authorization_endpoint data)
+                   :token-url (:token_endpoint data)
+                   :registration-url (:registration_endpoint data)
+                   :scope (or (first (:scopes_supported resource-data)) (first (:scopes_supported data)) "internal")}
+                  (recur (rest urls)))))))
+        (throw (ex-info "No authorization_servers in resource metadata" {:category :auth-discovery-failed}))))
+    (catch Object e
+      (let [fallback {:authorization-url (:authorization-url overrides)
+                      :token-url (:token-url overrides)
+                      :registration-url (:registration-url overrides)
+                      :scope (or (:scope overrides) "internal")}]
+        (when-not (:token-url fallback)
+          (throw (ex-info "Could not discover OAuth endpoints and no token-url override provided"
+                          {:category :auth-discovery-failed})))
+        fallback))))
+
 (defn authorize
-  "Full OAuth authorization-code + PKCE flow. Opens a loopback listener,
-   prints the authorization URL, waits for the redirect, exchanges the
-   code for tokens, and returns {:access-token :refresh-token :expires-in}.
-   Never writes tokens to files, logs, or evidence."
-  [transport {:keys [authorization-url token-url client-id scope service-id]
-              :or {scope "internal"}}]
-  (let [redirect-uri "http://127.0.0.1:0/"
-        verifier (pkce-verifier)
-        challenge (compute-challenge verifier)
-        state (pkce-verifier)
-        listener (start-listener 300000)
-        port (:port listener)
-        auth-url (str "https://robinhood.com/oauth?"
-                      (str/join "&" (map (fn [[k v]] (str k "=" (url-encode v)))
-                                         [["response_type" "code"]
-                                          ["client_id" client-id]
-                                          ["redirect_uri" (str/replace redirect-uri ":0" (str ":" port))]
-                                          ["scope" scope]
-                                          ["state" state]
-                                          ["code_challenge" challenge]
-                                          ["code_challenge_method" "S256"]])))]
+  "Full OAuth authorization-code + PKCE flow using discovered endpoints.
+   Takes an MCP server endpoint and optional overrides map:
+   {:authorization-url :token-url :registration-url :scope :service-id}
+   Overrides are used when discovery fails. Never writes tokens to files,
+   logs, or evidence."
+  [transport server-endpoint & [overrides]]
+  (let [opts (or overrides {})
+        metadata (discover-auth-metadata transport server-endpoint opts)
+        authz-url (:authorization-url metadata)
+        token-url (:token-url metadata)
+        reg-url (:registration-url metadata)
+        scope (:scope metadata)
+        service-id (:service-id opts server-endpoint)]
 
-    (println "--- OAuth Authorization Required ---")
-    (println (str "Open this URL to authorize \"" service-id "\":"))
-    (println auth-url)
-    (println "Waiting for callback (300s timeout)...")
-    
-    (let [callback (deref (:result listener) 300000 :auth-timeout)]
-      (net/close! (:server listener))
-      (when (= callback :auth-timeout)
-        (throw (ex-info "Authorization timed out" {:category :auth-timeout})))
-      (when (not= (:state callback) state)
-        (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
-      
-      (let [tokens (exchange-code transport token-url client-id
-                                  (str/replace redirect-uri ":0" (str ":" port))
-                                  (:code callback) verifier)]
-        tokens)))
+    ;; Dynamic client registration (auto-register)
+    (let [reg-id (or (:client-id opts)
+                    (when reg-url
+                      (try (let [r (register-client transport reg-url (or (:client-name opts) "attractor-client") "http://127.0.0.1:0/" scope)]
+                             (println (str "Client ID: " (:client-id r)))
+                             (:client-id r))
+                           (catch Object e
+                             (println (str "Registration failed: " (ex-message e)))
+                             nil))))
+          redirect-uri "http://127.0.0.1:0/"
+          verifier (pkce-verifier)
+          challenge (compute-challenge verifier)
+          state (pkce-verifier)
+          listener (start-listener 300000)
+          port (:port listener)
+          full-redirect (str/replace redirect-uri ":0" (str ":" port))
+          auth-url (str authz-url "?"
+                       (str/join "&" (map (fn [[k v]] (str k "=" (url-encode v)))
+                                          [["response_type" "code"]
+                                           ["client_id" client-id]
+                                           ["redirect_uri" full-redirect]
+                                           ["scope" scope]
+                                           ["state" state]
+                                           ["code_challenge" challenge]
+                                           ["code_challenge_method" "S256"]])))]
+      (println)
+      (println "--- OAuth Authorization Required ---")
+      (println (str "Open this URL to authorize: "))
+      (println auth-url)
+      (println "Waiting for callback (300s timeout)...")
 
+      (let [callback (deref (:result listener) 300000 :auth-timeout)]
+        (net/close! (:server listener))
+        (when (= callback :auth-timeout)
+          (throw (ex-info "Authorization timed out" {:category :auth-timeout})))
+        (when (not= (:state callback) state)
+          (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
+
+        (let [tokens (exchange-code transport token-url client-id full-redirect (:code callback) verifier)]
+          (println "Authorization complete.")
+          tokens)))))
