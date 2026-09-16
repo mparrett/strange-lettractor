@@ -306,8 +306,9 @@
                          :body (rpc-result (request-id request)
                                            {:content [{:type "text" :text "ok"}]})}
                         {:status 401 :headers {} :body "expired"}))
-          authorizer (fn [endpoint-transport endpoint overrides]
-                       (swap! handoffs conj {:endpoint endpoint :overrides overrides})
+          authorizer (fn [endpoint-transport endpoint descriptor opts]
+                       (swap! handoffs conj {:endpoint endpoint :descriptor descriptor
+                                             :opts opts})
                        {:access-token "oauth-token-2" :expires-in 3600})
           requests (atom [])
           session (make-session-with-mcp roots requests ["demo"] transport
@@ -323,7 +324,7 @@
           (is (str/includes? second-output "ok"))
           (is (= 1 (count @handoffs)))
           (is (= "https://m.example/mcp" (:endpoint (first @handoffs))))
-          (is (= "demo" (get-in (first @handoffs) [:overrides :service-id])))
+          (is (= "mcp:demo" (get-in (first @handoffs) [:opts :service-id])))
           (is (some true? (mapv :oauth-authorized @(:mcp_evidence @session))))
           (is (not (str/includes? (pr-str entry) "oauth-token-2"))))
         (finally (agent/close-session! session))))))
@@ -397,18 +398,24 @@
         transport (fn [request]
                     (swap! calls conj request)
                     {:status 201 :headers {"content-type" "application/json"}
-                     :body (json/write-json {:client_id "cid-1" :client_secret "shh"})})
+                     :body (json/write-json {:client_id "cid-1"})})
         result (mcp/perform-registration
                  transport "https://api.example/register" {:client_name "t"})]
     (is (= "cid-1" (:client-id result)))
-    (is (true? (:credential-issued result)))
+    (is (= 1 (count @calls)))
     (is (not (str/includes? (pr-str result) "shh"))))
+  (testing "secret-issuing server fails closed without returning the value"
+    (let [err (try (mcp/perform-registration
+                     (fn [_] {:status 201 :headers {"content-type" "application/json"}
+                              :body (json/write-json {:client_id "cid-1" :client_secret "shh"})})
+                     "https://api.example/register" {})
+                   (catch Object e e))]
+      (is (= :auth-registration-conflict (:category (ex-data err))))))
   (let [err (try (mcp/perform-registration
                    (fn [_] {:status 400 :headers {} :body "no"})
                    "https://api.example/register" {})
                  (catch Object e e))]
     (is (= :mcp-protocol-error (:category (ex-data err))))))
-
 (deftest authorize-guidance-names-endpoint-scope-and-exports
   (let [m (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
                  :authorization-endpoint "https://api.example/authorize"
@@ -875,4 +882,146 @@
             (is (every? string? results))
             (is (= 2 @token-hits))
             (is (= 6 (count @(:mcp_evidence @session))))))
+        (finally (agent/close-session! session))))))
+
+;; ---------------------------------------------------------------------------
+;; Keychain-backed bootstrap and token origins.
+;; ---------------------------------------------------------------------------
+
+(defn- oauth-manifest [endpoint]
+  (assoc (manifest-for "demo" endpoint [(query-tool)])
+         :refresh-token-env "MCP_TEST_REFRESH"
+         :token-endpoint "https://api.example/oauth2/token/"
+         :client-id "test-public-client"))
+
+(defn- keychain-store-fake [stored-map]
+  {:store (fn [_] nil)
+   :fetch (fn [{:keys [host username]}] (get stored-map [host username]))
+   :erase (fn [_] nil)})
+
+(deftest keychain-refresh-bootstraps-without-401
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo" (oauth-manifest "https://m.example/mcp"))
+    (let [auths (atom [])
+          transport (fn [request]
+                      (let [url (:url request)]
+                        (cond (str/includes? url "oauth2/token")
+                              {:status 200 :headers {"content-type" "application/json"}
+                               :body (json/write-json {:access_token "tok-keychain-boot"
+                                                       :expires_in 3600})}
+                              :else
+                              (do (swap! auths conj (get (:headers request) "authorization"))
+                                  {:status 200 :headers {"content-type" "application/json"}
+                                   :body (call-echo request "ok")}))))
+          store (keychain-store-fake {["api.example" "mcp:demo"] "tok-refresh-kc"})
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport (fn [_] nil)
+                    {:credential-store store})]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)
+              entry (last @(:mcp_evidence @session))]
+          (is (str/includes? output "ok"))
+          (is (= ["Bearer tok-keychain-boot"] @auths))
+          (is (= "keychain" (:token-origin entry)))
+          (is (false? (:token-reused entry)))
+          (is (some? (:token-expires-at entry))))
+        (finally (agent/close-session! session))))))
+
+(deftest broken-keychain-helper-fails-closed-at-admission
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo" (oauth-manifest "https://m.example/mcp"))
+    (let [store {:store (fn [_] nil)
+                 :fetch (fn [_] (throw (ex-info "keychain down" {})))
+                 :erase (fn [_] nil)}
+          requests (atom [])
+          err (try (make-session-with-mcp
+                     roots requests ["demo"]
+                     (fn [_] {:status 200 :headers {} :body "{}"})
+                     (fn [_] nil)
+                     {:credential-store store})
+                   (catch Object e e))]
+      (is (= :auth-store-failed (:category (ex-data err)))))))
+
+(deftest env-token-records-environment-origin
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo" (oauth-manifest "https://m.example/mcp"))
+    (let [requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"]
+                    (json-transport (atom []) (rpc-result 1 {:content [{:type "text" :text "ok"}]}))
+                    (fn [name] (get {"MCP_TEST_TOKEN" "tok-env"} name)))]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          ((:executor tool) {:symbol "AAA"} nil)
+          (let [entry (last @(:mcp_evidence @session))]
+            (is (= "environment" (:token-origin entry)))
+            (is (true? (:token-reused entry)))))
+        (finally (agent/close-session! session))))))
+
+(deftest handoff-overrides-carry-store-and-registration
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (-> (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                         (dissoc :token-env)
+                         (assoc :registration-endpoint "https://api.example/reg"
+                                :client-id "cid-9"
+                                :scope "internal")))
+    (let [seen (atom nil)
+          authorizer (fn [_ _ descriptor opts]
+                       (reset! seen {:descriptor descriptor :opts opts})
+                       {:access-token "tok-h" :refresh-token nil :expires-in 100})
+          requests (atom [])
+          profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+          session (agent/make-session
+                    {:provider_profile profile :execution_env (journey-env)
+                     :max_subagent_depth 0 :project_docs []
+                     :complete_fn (fn [request]
+                                    (swap! requests conj request)
+                                    {:message {:role :assistant :content "done"} :tool_calls []})})
+          out (mcp/admit-servers!
+                session ["demo"]
+                (assoc (base-opts roots (fn [_] {:status 401 :headers {} :body "no"})
+                                  (fn [_] nil))
+                       :oauth-authorizer authorizer))]
+      (try
+        (is (some? out))
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")]
+          (try ((:executor tool) {:symbol "AAA"} nil) (catch Object _ nil)))
+        (is (= "mcp:demo" (get-in @seen [:opts :service-id])))
+        (is (contains? (:opts @seen) :store))
+        (is (= "https://api.example/reg" (get-in @seen [:descriptor :registration-url])))
+        (is (= "cid-9" (get-in @seen [:descriptor :client-id])))
+        (finally (agent/close-session! session))))))
+
+(deftest keychain-identity-agrees-on-explicit-ports
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                            :refresh-token-env "MCP_TEST_REFRESH"
+                            :token-endpoint "https://api.example:8443/oauth2/token/"
+                            :client-id "test-public-client"))
+    (let [transport (fn [request]
+                      (let [url (:url request)]
+                        (if (str/includes? url "oauth2/token")
+                          {:status 200 :headers {"content-type" "application/json"}
+                           :body (json/write-json {:access_token "tok-port" :expires_in 3600})}
+                          {:status 200 :headers {"content-type" "application/json"}
+                           :body (call-echo request "ok")})))
+          store (keychain-store-fake {["api.example:8443" "mcp:demo"] "tok-refresh-port"})
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport (fn [_] nil)
+                    {:credential-store store})]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)
+              entry (last @(:mcp_evidence @session))]
+          (is (str/includes? output "ok"))
+          (is (= "keychain" (:token-origin entry))))
         (finally (agent/close-session! session))))))

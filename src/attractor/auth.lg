@@ -1,241 +1,645 @@
 (ns attractor.auth
+  "OAuth 2.0 authorization-code + PKCE handoff as framework capability.
+   Protocol-neutral: MCP servers, REST APIs, any HTTP service.
+
+   Flow: RFC 9728 discovery, RFC 7591 dynamic public-client registration,
+   PKCE S256, loopback listener echo-back capture, single-use code
+   exchange, memory-only access tokens, OS-keychain refresh persistence.
+   Access tokens never leave process memory. Refresh tokens persist only
+   in the OS keychain (never files, logs, evidence, shell history, or
+   argv). Every failure is fail-closed with an :auth-* category."
   (:require [clojure.string :as str]
             [clojure.core :as core]
             [json :as json]
             [hash :as hash]
             [net :as net]
             [io :as io]
+            [os :as os]
             [attractor.context-discovery :as capacity]))
 
+(def default-timeout-ms 15000)
+(def keychain-service-namespace "dev.attractor.oauth")
+
+(defn- fail! [category data]
+  (throw (ex-info (str "Auth: " (name category)) (assoc data :category category))))
+
+(defn- non-blank-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
 (defn- url-encode [text]
-  "URL-encode a string for query parameters."
-  (let [safe-chars #{\- \_ \~ \.}]
-    (apply str (map (fn [c]
-      (if (or (<= (int \a) (int c) (int \z)) (<= (int \A) (int c) (int \Z))
-              (<= (int \0) (int c) (int \9)) (contains? safe-chars c))
-        (str c)
-        (format "%%%02x" (int c))))
-                    text))))
+  (let [safe? (fn [character]
+                (or (and (<= (int \a) (int character)) (<= (int character) (int \z)))
+                    (and (<= (int \A) (int character)) (<= (int character) (int \Z)))
+                    (and (<= (int \0) (int character)) (<= (int character) (int \9)))
+                    (contains? #{\- \_ \. \~} character)))]
+    (apply str (map (fn [character]
+                      (if (safe? character)
+                        (str character)
+                        (format "%%%02x" (int character))))
+                    (str text)))))
 
-;;; OAuth 2.0 authorization-code + PKCE flow, RFC 9728 discovery,
-;;; RFC 7591 dynamic registration, loopback listener, keychain storage,
-;;; and token refresh. Protocol-neutral: works for MCP, REST APIs, etc.
+(defn- percent-decode [text]
+  (let [hex-value (fn [character]
+                    (cond (and (<= (int \0) (int character)) (<= (int character) (int \9)))
+                          (- (int character) (int \0))
+                          (and (<= (int \a) (int character)) (<= (int character) (int \f)))
+                          (+ 10 (- (int character) (int \a)))
+                          (and (<= (int \A) (int character)) (<= (int character) (int \F)))
+                          (+ 10 (- (int character) (int \A)))
+                          :else nil))]
+    (loop [remaining (seq (str text)) output ""]
+      (if (empty? remaining)
+        output
+        (let [character (first remaining)]
+          (cond (= character \+)
+                (recur (rest remaining) (str output " "))
 
-;; ─── PKCE ──────────────────────────────────────────────────────────
+                (and (= character \%) (>= (count remaining) 3))
+                (let [high (hex-value (second remaining))
+                      low (hex-value (nth remaining 2))]
+                  (if (and (some? high) (some? low))
+                    (recur (drop 3 remaining) (str output (char (+ (* 16 high) low))))
+                    (recur (rest remaining) (str output character))))
 
-(defn- random-hex [bytes]
-  (str/join (map (fn [_] (format "%02x" (rand-int 256))) (range bytes))))
+                :else
+                (recur (rest remaining) (str output character))))))))
 
-(defn- sha256-hex [text]
-  (hash/sha256 text))
-
-(defn- base64url [hex-str]
-  (let [raw (byte-array (map #(Integer/parseInt (str "0x" (apply str (drop-while #{\newline} (partition 2 (str hex-str)))))) []))]
-    ;; Pinned openssl path — let-go has no bytes->base64 built-in
-    ""))
+;; ---------------------------------------------------------------------------
+;; PKCE (RFC 7636, S256).
+;; ---------------------------------------------------------------------------
 
 (defn pkce-verifier []
-  "Generate a 64-hex-char PKCE code verifier from 2 random UUIDs."
-  (str (random-hex 16) (random-hex 16)))
+  "64-hex-char verifier: SHA-256 hex of two crypto-random UUIDs.
+   Fixed length by construction (avoids UUID string-format details),
+   unreserved charset, ~244 bits of entropy."
+  (hash/sha256 (str (random-uuid) (random-uuid))))
 
-;; ─── Discovery (RFC 9728) ──────────────────────────────────────────
+(defn- openssl-version-ok? [command]
+  (try
+    (= 0 (:exit (capacity/call!
+                  (fn [] (os/sh command "version"))
+                  {:timeout_ms 10000})))
+    (catch Object _ false)))
+
+(defn openssl-available? []
+  "True when an openssl binary answers --version within budget."
+  (boolean (or (openssl-version-ok? "/usr/bin/openssl")
+               (openssl-version-ok? "openssl"))))
+
+(defn- openssl-pipeline [verifier]
+  (let [candidates [["/usr/bin/openssl"] ["openssl"]]
+        attempt (fn [command]
+                  (let [outcome (capacity/call!
+                                  (fn []
+                                    (let [process (os/with-stdin
+                                                    (apply os/exec (conj command "dgst" "-sha256" "-binary"))
+                                                    verifier)]
+                                      (try (.Output process)
+                                           (catch Object _ :failed))))
+                                  {:timeout_ms 15000})]
+                    (if (and (map? outcome) (= :unavailable (:status outcome)))
+                      :failed
+                      outcome)))]
+    (loop [remaining candidates]
+      (if (empty? remaining)
+        (fail! :auth-pkce-unavailable {:reason :openssl-missing})
+        (let [output (attempt (first remaining))]
+          (if (= :failed output)
+            (recur (rest remaining))
+            output))))))
+
+(defn pkce-challenge
+  "S256 challenge for a verifier: BASE64URL(SHA256(verifier)). The digest
+   flows through a bounded openssl pipeline with the verifier on stdin
+   only, never argv. run-openssl injects (fn [verifier] -> base64-string)
+   for tests; the default runs the real pipeline."
+  [verifier & [run-openssl]]
+  (let [digest-string (if (some? run-openssl)
+                        (try (run-openssl verifier)
+                             (catch Object _
+                               (fail! :auth-pkce-unavailable {:reason :challenge-failed})))
+                        (openssl-pipeline verifier))
+        standard (try (base64-encode digest-string)
+                      (catch Object _
+                        (fail! :auth-pkce-unavailable {:reason :base64-failed})))]
+    (-> standard
+        (str/replace "+" "-")
+        (str/replace "/" "_")
+        (str/replace #"=+$" ""))))
+
+(defn authorization-url
+  "Build the authorization redirect target. Values are URL-encoded."
+  [{:keys [authorization-endpoint client-id redirect-uri scope state code-challenge]}]
+  (str authorization-endpoint
+       (if (str/includes? (str authorization-endpoint) "?") "&" "?")
+       (str/join "&"
+                 [(str "response_type=code")
+                  (str "client_id=" (url-encode client-id))
+                  (str "redirect_uri=" (url-encode redirect-uri))
+                  (str "scope=" (url-encode scope))
+                  (str "state=" (url-encode state))
+                  (str "code_challenge=" (url-encode code-challenge))
+                  "code_challenge_method=S256"])))
+
+;; ---------------------------------------------------------------------------
+;; Credential store: OS keychain through git credential-osxkeychain.
+;; ---------------------------------------------------------------------------
+;; Secrets travel on STDIN ONLY (git-credential protocol), never argv.
+;; The store map {:store :fetch :erase} takes {:host :username :secret?}
+;; where username carries the service-id (e.g. "mcp:trading"), so keychain
+;; items stay service-scoped without collisions.
+
+(defn- default-run-command [argv stdin-text]
+  (let [command (apply os/exec argv)
+        fed (os/with-stdin command (str stdin-text))]
+    (try
+      (let [output (.Output fed)]
+        {:exit 0 :out (str output) :err ""})
+      (catch Object error
+        {:exit 1 :out "" :err (ex-message error)}))))
+
+(defn osxkeychain-store
+  "Production macOS credential store over git credential-osxkeychain
+   (store/get/erase). :run-command injects (fn [argv stdin] -> map) for
+   tests; the default shells out with secrets on stdin only."
+  [& [opts]]
+  (let [run-command (or (:run-command opts) default-run-command)
+        invoke (fn [verb entry]
+                 (try
+                   (run-command ["git" "credential-osxkeychain" verb]
+                                (str "protocol=https\n"
+                                     "host=" (:host entry) "\n"
+                                     "username=" (:username entry) "\n"
+                                     (when (:secret entry)
+                                       (str "password=" (:secret entry) "\n"))
+                                     "\n"))
+                   (catch Object error
+                     {:exit 1 :out "" :err (ex-message error)})))]
+    {:store (fn [{:keys [host username secret]}]
+              (let [result (invoke "store" {:host host :username username :secret secret})]
+                (when-not (= 0 (:exit result))
+                  (fail! :auth-store-failed {:op :store :host host :username username}))
+                nil))
+     :fetch (fn [{:keys [host username]}]
+              (let [result (invoke "get" {:host host :username username})]
+                (when-not (= 0 (:exit result))
+                  (fail! :auth-store-failed {:op :fetch :host host :username username}))
+                (let [lines (str/split (str (:out result)) #"\r?\n")
+                      password (some (fn [line]
+                                       (when (str/starts-with? line "password=")
+                                         (subs line (count "password="))))
+                                     lines)]
+                  (when-not (str/blank? password) password))))
+     :erase (fn [{:keys [host username]}]
+              (let [result (invoke "erase" {:host host :username username})]
+                (when-not (= 0 (:exit result))
+                  (fail! :auth-store-failed {:op :erase :host host :username username}))
+                nil))}))
+
+(defn default-token-reader
+  "Admission-time reader: explicit process env first, then the keychain
+   entry for (token-host, service-id). Returns the value or nil."
+  [store service-id token-host]
+  (fn [env-name]
+    (let [from-env (os/getenv (str env-name))]
+      (if-not (str/blank? from-env)
+        from-env
+        (when (and (some? store) (non-blank-string? token-host))
+          (try ((:fetch store) {:host token-host :username service-id})
+               (catch Object _ nil)))))))
+
+(defn auth-status
+  "Presence probe without values: is a refresh token stored for this
+   service identity? Returns {:refresh-present bool}."
+  [store service-id token-host]
+  {:refresh-present
+   (boolean (try (some? ((:fetch store) {:host token-host :username service-id}))
+                 (catch Object _ false)))})
+
+;; ---------------------------------------------------------------------------
+;; Discovery (RFC 9728 + RFC 8414) and dynamic registration (RFC 7591).
+;; ---------------------------------------------------------------------------
+
+(defn- bounded-call [transport request timeout-ms]
+  (let [outcome (capacity/call! (fn [] (transport request))
+                                {:timeout_ms (or timeout-ms default-timeout-ms)})]
+    (if (and (map? outcome) (= :unavailable (:status outcome)))
+      (fail! :auth-transport-error {:reason (:reason outcome)})
+      outcome)))
 
 (defn discover-resource
-  "Fetch unauthenticated protected-resource metadata. Returns a map or throws."
-  [transport resource-url]
-  (let [resp (transport {:method :get :url (str resource-url "/.well-known/oauth-protected-resource/") :headers {"accept" "application/json"}})
-        body (json/read-json (:body resp))]
-    (when-not (:authorization_servers body)
-      (throw (ex-info "Missing authorization_servers in resource metadata" {:category :auth-discovery-failed})))
+  "Fetch unauthenticated protected-resource metadata for a resource URL.
+   Returns the raw metadata map or throws :auth-discovery-failed."
+  [transport resource-url & [opts]]
+  (when-not (str/starts-with? (str resource-url) "https://")
+    (fail! :auth-endpoint-not-https {:reason :resource-url-must-be-https}))
+  (let [response (bounded-call
+                   transport
+                   {:method :get
+                    :url (str resource-url "/.well-known/oauth-protected-resource/")
+                    :headers {"accept" "application/json"}}
+                   (:timeout-ms opts))
+        body (try (json/read-json (str (:body response)))
+                  (catch Object _
+                    (fail! :auth-discovery-failed {:reason :metadata-not-json})))]
+    (when-not (map? body)
+      (fail! :auth-discovery-failed {:reason :metadata-not-an-object}))
+    (let [servers (get body "authorization_servers")]
+      (when-not (or (and (vector? servers) (seq servers))
+                    (non-blank-string? servers))
+        (fail! :auth-discovery-failed {:reason :missing-authorization-servers})))
     body))
 
-;; ─── Dynamic registration (RFC 7591) ───────────────────────────────
+(defn- discover-server-metadata [transport issuer opts]
+  (when-not (str/starts-with? (str issuer) "https://")
+    (fail! :auth-endpoint-not-https {:reason :issuer-must-be-https}))
+  (let [candidates [(str issuer "/.well-known/oauth-authorization-server")
+                    (str issuer "/.well-known/openid-configuration")]]
+    (loop [remaining candidates]
+      (if (empty? remaining)
+        (fail! :auth-discovery-failed {:reason :server-metadata-not-found})
+        (let [response (try
+                         (bounded-call
+                           transport
+                           {:method :get :url (first remaining)
+                            :headers {"accept" "application/json"}}
+                           (:timeout-ms opts))
+                         (catch Object _ nil))
+              body (when (and (some? response) (= 200 (:status response)))
+                     (try (json/read-json (str (:body response)))
+                          (catch Object _ nil)))]
+          (if (map? body)
+            body
+            (recur (rest remaining))))))))
+
+(defn resolve-endpoints
+  "Resolve OAuth endpoints: explicit descriptor fields win, otherwise
+   RFC 9728 + RFC 8414 discovery. Returns {:authorization-endpoint
+   :token-endpoint :registration-endpoint :scope :token-auth-methods}."
+  [transport resource-url descriptor & [opts]]
+  (let [explicit {:authorization-endpoint (:authorization-endpoint descriptor)
+                  :token-endpoint (:token-endpoint descriptor)
+                  :registration-endpoint (:registration-endpoint descriptor)
+                  :scope (:scope descriptor)}
+        https-only! (fn [endpoints]
+                      (doseq [key [:authorization-endpoint :token-endpoint
+                                   :registration-endpoint]]
+                        (let [url (get endpoints key)]
+                          (when (and (some? url)
+                                     (or (not (string? url))
+                                         (not (str/starts-with? url "https://"))))
+                            (fail! :auth-endpoint-not-https
+                                   {:reason :oauth-endpoints-must-be-https
+                                    :field key}))))
+                      endpoints)]
+    (if (and (non-blank-string? (:authorization-endpoint explicit))
+             (non-blank-string? (:token-endpoint explicit)))
+      (https-only! (assoc explicit :token-auth-methods nil))
+      (let [resource (discover-resource transport resource-url opts)
+            servers (get resource "authorization_servers")
+            issuer (if (vector? servers) (first servers) servers)
+            server-meta (discover-server-metadata transport (str issuer) opts)
+            scopes (or (get resource "scopes_supported") [])]
+        (https-only!
+          {:authorization-endpoint (get server-meta "authorization_endpoint")
+           :token-endpoint (get server-meta "token_endpoint")
+           :registration-endpoint (get server-meta "registration_endpoint")
+           :scope (or (:scope explicit)
+                      (when (vector? scopes)
+                        (when (seq scopes) (str (first scopes))))
+                      (when (non-blank-string? scopes) scopes)
+                      "internal")
+           :token-auth-methods (get server-meta "token_endpoint_auth_methods_supported")})))))
+
+(defn- check-public-client! [methods]
+  (when (and (some? methods)
+             (not (some #(= "none" %) methods)))
+    (fail! :auth-policy-mismatch
+           {:reason :confidential-auth-method-required
+            :methods methods})))
 
 (defn register-client
   "Register a public OAuth client with a dynamic registration endpoint.
-   Returns {:client-id} (secret is NEVER returned)."
-  [transport registration-url client-name redirect-uri scope]
+   Fails closed with :auth-registration-conflict when the server issues
+   a secret against auth method none; the secret value is never returned."
+  [transport registration-url client-name redirect-uri scope & [opts]]
   (let [payload {:client_name client-name :redirect_uris [redirect-uri]
                  :grant_types ["authorization_code"] :response_types ["code"]
                  :token_endpoint_auth_method "none" :scope scope}
-        resp (transport {:method :post :url registration-url :body (json/write-json payload)
-                         :headers {"content-type" "application/json" "accept" "application/json"}})
-        body (json/read-json (:body resp))]
-    (when (and (contains? body :client_secret) (not (str/blank? (:client_secret body))))
-      (throw (ex-info "Server issued a client secret but auth method is :none" {:category :auth-registration-conflict})))
-    {:client-id (:client_id body)}))
+        response (bounded-call
+                   transport
+                   {:method :post :url registration-url
+                    :body (json/write-json payload)
+                    :headers {"content-type" "application/json"
+                              "accept" "application/json"}}
+                   (:timeout-ms opts))
+        body (try (json/read-json (str (:body response)))
+                  (catch Object _
+                    (fail! :auth-registration-failed {:reason :registration-malformed})))]
+    (when-not (map? body)
+      (fail! :auth-registration-failed {:reason :registration-not-an-object}))
+    (when (non-blank-string? (get body "client_secret"))
+      (fail! :auth-registration-conflict
+             {:reason :server-issued-secret-for-public-client}))
+    (when-not (non-blank-string? (get body "client_id"))
+      (fail! :auth-registration-failed {:reason :registration-without-client-id}))
+    {:client-id (get body "client_id")}))
 
-;; ─── Loopback listener ─────────────────────────────────────────────
+(defn exchange-code
+  "Single authorization-code exchange. Returns {:access-token
+   :refresh-token :expires-in}. Callers enforce single-use per code."
+  [transport token-endpoint code redirect-uri client-id code-verifier & [opts]]
+  (let [form (str "grant_type=authorization_code"
+                  "&code=" (url-encode code)
+                  "&redirect_uri=" (url-encode redirect-uri)
+                  "&client_id=" (url-encode client-id)
+                  "&code_verifier=" (url-encode code-verifier))
+        response (bounded-call
+                   transport
+                   {:method :post :url token-endpoint
+                    :headers {"content-type" "application/x-www-form-urlencoded"
+                              "accept" "application/json"}
+                    :body form}
+                   (:timeout-ms opts))
+        body (try (json/read-json (str (:body response)))
+                  (catch Object _
+                    (fail! :auth-exchange-failed {:reason :exchange-malformed})))]
+    (when-not (map? body)
+      (fail! :auth-exchange-failed {:reason :exchange-not-an-object}))
+    (let [server-error (get body "error")]
+      (when (some? server-error)
+        (fail! :auth-exchange-failed {:reason :exchange-rejected
+                                     :error-code (when (map? server-error)
+                                                   (get server-error "code"))})))
+    (when-not (non-blank-string? (get body "access_token"))
+      (fail! :auth-exchange-failed {:reason :exchange-without-token}))
+    {:access-token (get body "access_token")
+     :refresh-token (get body "refresh_token")
+     :expires-in (get body "expires_in")}))
 
-(defn- parse-query [url]
-  (let [[_ qs] (str/split url #"\?" 2)]
-    (when qs
-      (into {} (map (fn [pair] (let [[k v] (str/split pair #"=" 2)] [k v]))
-                    (str/split qs #"&"))))))
+;; ---------------------------------------------------------------------------
+;; Loopback listener: echo-back capture, single-shot, off-chat.
+;; ---------------------------------------------------------------------------
+
+(defn- split-first
+  "Split text on the first occurrence of a literal separator, returning
+   [before after]. Limit-bounded split is unavailable, so index into it."
+  [text separator]
+  (let [s (str text)
+        sep (str separator)
+        idx (str/index-of s sep)]
+    (if (nil? idx)
+      [s ""]
+      [(subs s 0 idx)
+       (subs s (+ idx (count sep)))])))
+
+(defn- buffer-text [bytes]
+  (let [buffer (io/buffer)]
+    (.Write buffer bytes)
+    (io/buffer-str buffer)))
+
+(defn- read-request-text [connection max-bytes]
+  (loop [chunks [] total 0]
+    (let [piece (try (net/read! connection (min 4096 (- max-bytes total)))
+                     (catch Object _ nil))]
+      (if (nil? piece)
+        (str/join "" chunks)
+        (let [text (buffer-text piece)
+              combined (str (str/join "" chunks) text)]
+          (if (or (str/includes? combined "\r\n\r\n")
+                  (>= (count (bytes combined)) max-bytes))
+            combined
+            (recur (conj chunks text) (count (bytes combined)))))))))
+
+(defn- reason-phrase [status]
+  (if (= status 200) "OK" "Bad Request"))
+
+(defn- write-response! [connection status text]
+  (let [body (str text)
+        response (str "HTTP/1.0 " status " " (reason-phrase status) "\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: " (count (bytes body)) "\r\n"
+                      "Connection: close\r\n\r\n" body)]
+    (try (net/write! connection response) (catch Object _ nil))
+    (try (net/close! connection) (catch Object _ nil))
+    nil))
+
+(defn- handle-one-redirect! [state-atom connection expected-state path]
+  (let [request-text (read-request-text connection 8192)
+        request-line (first (str/split request-text #"\r\n"))
+        parts (str/split (or request-line "") #" ")
+        method (first parts)
+        target (second parts)
+        split-target (split-first (or target "") "?")
+        target-path (first split-target)
+        query (second split-target)
+        params (if (str/blank? query)
+                 {}
+                 (into {} (map (fn [pair]
+                                 (let [kv (split-first pair "=")]
+                                   [(percent-decode (first kv))
+                                    (percent-decode (second kv))]))
+                               (str/split query #"&"))))
+        code (get params "code")
+        state (get params "state")]
+    (swap! state-atom update :requests inc)
+    (cond (not (and (= "GET" method) (= path target-path)))
+          (do (swap! state-atom update :mismatches inc)
+              (write-response! connection 404 "Not found."))
+
+          (or (str/blank? code) (not (= expected-state state)))
+          (do (swap! state-atom update :mismatches inc)
+              (write-response! connection 400 "Missing or mismatched code/state."))
+
+          (some? (:captured @state-atom))
+          (do (swap! state-atom update :mismatches inc)
+              (write-response! connection 400 "Code already captured."))
+
+          :else
+          (do (swap! state-atom assoc :captured {:code code}
+                     :captured-count (inc (:captured-count @state-atom 0)))
+              (write-response! connection 200 "Authorized. You may close this window.")))))
 
 (defn start-listener
-  "Bind 127.0.0.1:0, return {:server :port :path} for the URL to open.
-   Waits for one GET to /?code=...&state=... and returns the code.
-   Timeout in ms; on timeout or any error, returns :auth-timeout."
-  [timeout-ms]
-  (let [listener (net/listen "127.0.0.1" 0)
+  "Bind 127.0.0.1 (ephemeral port by default) for one OAuth echo-back.
+   Only GETs to path with a matching state are captured; everything else
+   is counted and answered 400/404. Returns {:server :port :state-atom}."
+  [expected-state opts]
+  (when (str/blank? (str expected-state))
+    (fail! :auth-configuration {:reason :listener-requires-non-blank-state}))
+  (let [options (or opts {})
+        listener (net/listen "127.0.0.1" (or (:port options) 0))
         port (:port (net/local-address listener))
-        result (promise)]
+        state-atom (atom {:expected expected-state
+                          :path (or (:path options) "/callback")
+                          :requests 0 :mismatches 0
+                          :captured nil :captured-count 0
+                          :closed false})]
     (core/future
       (try
-        (let [conn (net/accept listener)
-              raw (net/read! conn 8192)
-              [method path] (str/split (first (str/split raw #"\r\n")) #" ")
-              params (parse-query (str/replace path " " ""))
-              code (:code params)
-              state (:state params)]
-          (when (and code state)
-            (deliver result {:code code :state state}))
-          (io/write! conn "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK")
-          (net/close! conn))
-        (catch Object _ (deliver result :auth-timeout))
-        (finally (net/close! listener))))
-    {:server listener :port port :result result}))
+        (loop []
+          (let [state @state-atom
+                live? (and (not (:closed state))
+                           (< (:requests state) (or (:max-requests options) 32))
+                           (nil? (:captured state)))]
+            (if live?
+              (do (let [connection (try (net/accept listener) (catch Object _ nil))]
+                    (when (some? connection)
+                      (try
+                        (let [outcome (capacity/call!
+                                        (fn []
+                                          (handle-one-redirect! state-atom connection expected-state
+                                                                (:path @state-atom))
+                                          :done)
+                                        {:timeout_ms 30000})]
+                          (when (and (map? outcome) (= :unavailable (:status outcome)))
+                            (try (net/close! connection) (catch Object _ nil))))
+                        (catch Object _ nil))))
+                  (recur))
+              nil)))
+        (catch Object _ nil)
+        (finally (try (net/close! listener) (catch Object _ nil)))))
+    {:server listener :port port :state-atom state-atom}))
 
-;; ─── Authorize flow ────────────────────────────────────────────────
+(defn close-code-listener!
+  "Idempotent listener teardown."
+  [server]
+  (try (swap! (:state-atom server) assoc :closed true) (catch Object _ nil))
+  (try (net/close! (:server server)) (catch Object _ nil))
+  nil)
 
-
-(defn- compute-challenge [verifier]
-  "PKCE S256 challenge via openssl pipeline: SHA-256 then base64url."
-  (let [proc (os/sh "openssl" "dgst" "-sha256" "-binary")
-        _ (io/write! (:stdin proc) verifier)
-        _ (io/close! (:stdin proc))
-        raw (str/trim (:stdout proc))
-        b64 (if (str/blank? raw)
-              (throw (ex-info "openssl pipeline failed" {:category :auth-pkce-failed}))
-              raw)]
-    (str/replace (str/replace b64 #"\\+" "") #"=+$" "")))
-
-(defn- build-auth-url [client-id redirect-uri scope state challenge]
-  (str "https://robinhood.com/oauth?"
-       (str/join "&" (map (fn [[k v]] (str k "=" v))
-                          [["response_type" "code"]
-                           ["client_id" client-id]
-                           ["redirect_uri" redirect-uri]
-                           ["scope" scope]
-                           ["state" state]
-                           ["code_challenge" challenge]
-                           ["code_challenge_method" "S256"]]))))
-
-(defn- exchange-code [transport token-url client-id redirect-uri code verifier]
-  (let [body (str/join "&" (map (fn [[k v]] (str k "=" v))
-                                [["grant_type" "authorization_code"]
-                                 ["code" code]
-                                 ["redirect_uri" redirect-uri]
-                                 ["client_id" client-id]
-                                 ["code_verifier" verifier]]))
-        resp (transport {:method :post :url token-url
-                         :headers {"content-type" "application/x-www-form-urlencoded"}
-                         :body body})
-        data (json/read-json (:body resp))]
-    (when (:error data)
-      (throw (ex-info (str "Token exchange failed: " (:error data))
-                      {:category :auth-exchange-failed :error-data data})))
-    {:access-token (:access_token data)
-     :refresh-token (:refresh_token data)
-     :expires-in (:expires_in data)}))
-
-
-(defn- discover-auth-metadata
-  "Discover OAuth endpoints per MCP spec (RFC 9728 + RFC 8414).
-   Returns {:authorization-url :token-url :registration-url :scope}.
-   Falls back to explicit overrides when discovery fails."
-  [transport server-endpoint overrides]
-  (try
-    ;; Step 1: Fetch resource metadata from MCP well-known path (RFC 9728)
-    (let [endpoint-parts (str/split (str/replace server-endpoint "://" "/") #"/")
-          host (second endpoint-parts)
-          path (str/join "/" (drop 2 endpoint-parts))
-          resource-url (str "https://" host "/.well-known/oauth-protected-resource/" path)
-          resource-resp (transport {:method :get :url resource-url :headers {"accept" "application/json"}})
-          resource-data (try (json/read-json (:body resource-resp)) {})
-          auth-servers (:authorization_servers resource-data)]
-      (if (seq auth-servers)
-        ;; Step 2: Fetch authorization server metadata from first server (RFC 8414)
-        (let [issuer (first auth-servers)
-              ;; Try standard RFC 8414 discovery first, then fall back to path-based
-              rfc8414-urls [(str issuer "/.well-known/oauth-authorization-server/")
-                            (str (str/replace issuer (re-pattern (str host ".*")) (str host "/.well-known/oauth-authorization-server/" path)))]]
-          (loop [urls rfc8414-urls]
-            (if (empty? urls)
-              (throw (ex-info "Authorization server metadata not found" {:category :auth-discovery-failed}))
-              (let [resp (transport {:method :get :url (first urls) :headers {"accept" "application/json"}})
-                    data (try (json/read-json (:body resp)) nil)]
-                (if data
-                  {:authorization-url (:authorization_endpoint data)
-                   :token-url (:token_endpoint data)
-                   :registration-url (:registration_endpoint data)
-                   :scope (or (first (:scopes_supported resource-data)) (first (:scopes_supported data)) "internal")}
-                  (recur (rest urls)))))))
-        (throw (ex-info "No authorization_servers in resource metadata" {:category :auth-discovery-failed}))))
-    (catch Object e
-      (let [fallback {:authorization-url (:authorization-url overrides)
-                      :token-url (:token-url overrides)
-                      :registration-url (:registration-url overrides)
-                      :scope (or (:scope overrides) "internal")}]
-        (when-not (:token-url fallback)
-          (throw (ex-info "Could not discover OAuth endpoints and no token-url override provided"
-                          {:category :auth-discovery-failed})))
-        fallback))))
+(defn await-code!
+  "Wait up to timeout-ms for the captured code. Closes the listener in
+   both outcomes, then returns {:code} or throws :auth-timeout."
+  [server timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (or timeout-ms 300000))]
+    (loop []
+      (let [state @(:state-atom server)]
+        (if (some? (:captured state))
+          (do (close-code-listener! server)
+              {:code (get (:captured state) :code)})
+          (if (>= (System/currentTimeMillis) deadline)
+            (do (close-code-listener! server)
+                (fail! :auth-timeout {:reason :authorization-not-completed}))
+            (do (core/sleep 50)
+                (recur))))))))
+(defn token-host
+  "Canonical keychain host for a token endpoint: scheme stripped, path
+   stripped, port KEPT (explicit ports are distinct identities). This is
+   the single shared host function: writers (authorize persistence) and
+   readers (session refresh lookup) must agree exactly."
+  [url]
+  (let [s (str url)
+        after (if-let [idx (str/index-of s "://")] (subs s (+ idx 3)) s)
+        end (or (str/index-of after "/") (count after))]
+    (subs after 0 end)))
 
 (defn authorize
-  "Full OAuth authorization-code + PKCE flow using discovered endpoints.
-   Takes an MCP server endpoint and optional overrides map:
-   {:authorization-url :token-url :registration-url :scope :service-id}
-   Overrides are used when discovery fails. Never writes tokens to files,
-   logs, or evidence."
-  [transport server-endpoint & [overrides]]
-  (let [opts (or overrides {})
-        metadata (discover-auth-metadata transport server-endpoint opts)
-        authz-url (:authorization-url metadata)
-        token-url (:token-url metadata)
-        reg-url (:registration-url metadata)
-        scope (:scope metadata)
-        service-id (:service-id opts server-endpoint)]
+  "Full OAuth authorization-code + PKCE handoff for one service.
+   descriptor: {:authorization-endpoint :token-endpoint
+   :registration-endpoint? :scope :client-id?}. When endpoints are blank,
+   resource-url enables RFC 9728 discovery. opts: :store (credential store
+   map for refresh persistence; absent means memory-only), :service-id
+   (required with :store), :on-url (fn [url], default prints), :timeout-ms,
+   :port, :pkce-run (openssl injection for tests), :client-name.
 
-    ;; Dynamic client registration (auto-register)
-    (let [reg-id (or (:client-id opts)
-                    (when reg-url
-                      (try (let [r (register-client transport reg-url (or (:client-name opts) "attractor-client") "http://127.0.0.1:0/" scope)]
-                             (println (str "Client ID: " (:client-id r)))
-                             (:client-id r))
-                           (catch Object e
-                             (println (str "Registration failed: " (ex-message e)))
-                             nil))))
-          redirect-uri "http://127.0.0.1:0/"
-          verifier (pkce-verifier)
-          challenge (compute-challenge verifier)
+   The code is exchanged exactly once; refresh tokens persist only via
+   :store, access tokens stay memory-only. Returns {:service-id
+   :access-token :expires-in :expires-at-ms :refresh-stored :flow-evidence}
+   with no secret values anywhere in the evidence."
+  [transport resource-url descriptor & [opts]]
+  (let [options (or opts {})
+        timeout-ms (or (:timeout-ms options) 300000)
+        store (:store options)
+        service-id (or (:service-id options) resource-url)
+        resolved {:authorization-endpoint (or (:authorization-endpoint descriptor)
+                                              (:authorization-url descriptor))
+                  :token-endpoint (or (:token-endpoint descriptor)
+                                      (:token-url descriptor))
+                  :registration-endpoint (or (:registration-endpoint descriptor)
+                                             (:registration-url descriptor))
+                  :scope (or (:scope descriptor) "internal")
+                  :client-id (:client-id descriptor)}
+        ;; Explicit endpoints skip the public-client check: there is no
+        ;; metadata to check against, so explicit configuration asserts a
+        ;; public client by operator intent. Discovery always enforces it.
+        endpoints (if (and (non-blank-string? (:authorization-endpoint resolved))
+                           (non-blank-string? (:token-endpoint resolved)))
+                    (assoc resolved :token-auth-methods nil)
+                    (let [discovered (resolve-endpoints transport resource-url resolved options)]
+                      (check-public-client! (:token-auth-methods discovered))
+                      discovered))]
+    (when-not (and (non-blank-string? (:authorization-endpoint endpoints))
+                   (non-blank-string? (:token-endpoint endpoints)))
+      (fail! :auth-configuration {:reason :oauth-endpoints-unresolved}))
+    (let [verifier (pkce-verifier)
+          challenge (pkce-challenge verifier (:pkce-run options))
           state (pkce-verifier)
-          listener (start-listener 300000)
-          port (:port listener)
-          full-redirect (str/replace redirect-uri ":0" (str ":" port))
-          auth-url (str authz-url "?"
-                       (str/join "&" (map (fn [[k v]] (str k "=" (url-encode v)))
-                                          [["response_type" "code"]
-                                           ["client_id" reg-id]
-                                           ["redirect_uri" full-redirect]
-                                           ["scope" scope]
-                                           ["state" state]
-                                           ["code_challenge" challenge]
-                                           ["code_challenge_method" "S256"]])))]
-      (println)
-      (println "--- OAuth Authorization Required ---")
-      (println (str "Open this URL to authorize: "))
-      (println auth-url)
-      (println "Waiting for callback (300s timeout)...")
-
-      (let [callback (deref (:result listener) 300000 :auth-timeout)]
-        (net/close! (:server listener))
-        (when (= callback :auth-timeout)
-          (throw (ex-info "Authorization timed out" {:category :auth-timeout})))
-        (when (not= (:state callback) state)
-          (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
-
-        (let [tokens (exchange-code transport token-url reg-id full-redirect (:code callback) verifier)]
-          (println "Authorization complete.")
-          tokens)))))
+          server (start-listener state {:port (:port options) :timeout-ms timeout-ms})
+          redirect-uri (str "http://127.0.0.1:" (:port server) "/callback")
+          exchanged? (atom false)
+          started-at (System/currentTimeMillis)]
+      (try
+        (let [client-id (or (:client-id endpoints)
+                            (:client-id resolved)
+                            (when (:registration-endpoint endpoints)
+                              (:client-id (register-client
+                                            transport
+                                            (:registration-endpoint endpoints)
+                                            (or (:client-name options) "attractor-client")
+                                            redirect-uri
+                                            (:scope endpoints)))))
+              _ (when (str/blank? (str client-id))
+                  (fail! :auth-configuration {:reason :client-id-unresolved}))
+              auth-url (authorization-url
+                         {:authorization-endpoint (:authorization-endpoint endpoints)
+                          :client-id client-id
+                          :redirect-uri redirect-uri
+                          :scope (:scope endpoints)
+                          :state state
+                          :code-challenge challenge})]
+          ((or (:on-url options)
+               (fn [url]
+                 (println "Open this URL to authorize:")
+                 (println url)
+                 (println "Waiting for the loopback callback; complete the browser step.")
+                 nil))
+           auth-url)
+          (let [captured (await-code! server timeout-ms)
+                tokens (do (when @exchanged?
+                             (fail! :auth-code-reused {:reason :exchange-already-attempted}))
+                           (reset! exchanged? true)
+                           (exchange-code transport (:token-endpoint endpoints)
+                                          (:code captured) redirect-uri client-id verifier
+                                          opts))
+                expires-at (when (integer? (:expires-in tokens))
+                             (+ (System/currentTimeMillis)
+                                (* 1000 (max 0 (:expires-in tokens)))))
+                refresh-token (:refresh-token tokens)
+                refresh-stored (boolean
+                                 (when (and (some? store)
+                                            (non-blank-string? service-id)
+                                            (non-blank-string? refresh-token))
+                                   ((:store store) {:host (token-host (:token-endpoint endpoints))
+                                                    :username service-id
+                                                    :secret refresh-token})
+                                   true))
+                completed-at (System/currentTimeMillis)
+                stats @(:state-atom server)]
+            {:service-id service-id
+           :client-id client-id
+             :access-token (:access-token tokens)
+             :expires-in (:expires-in tokens)
+             :expires-at-ms expires-at
+             :refresh-stored refresh-stored
+             :flow-evidence {:service-id service-id
+                             :token-host (token-host (:token-endpoint endpoints))
+                             :redirect-port (:port server)
+                             :requests-seen (:requests stats)
+                             :mismatches (:mismatches stats)
+                             :exchanges 1
+                             :refresh-stored refresh-stored
+                             :expires-in (:expires-in tokens)
+                             :started-at started-at
+                             :completed-at completed-at}}))
+        (finally (close-code-listener! server))))))

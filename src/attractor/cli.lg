@@ -811,8 +811,6 @@
                          (os/exit 1)))]
           (println (str "Client ID for " id ": " (:client-id result)))
           (println "Store it as :client-id in user config; keep it out of the repo.")
-          (when (:credential-issued result)
-            (println "WARNING: the server also issued a credential, which is NOT shown or stored. Handle it out of band."))
           (os/exit 0))))))
 
 

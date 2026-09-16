@@ -1,47 +1,41 @@
 (ns main
-  "SCN-MCP-PILOT-TRADING: live handshake + refresh proof against the
-   Robinhood MCP pilot (https://agent.robinhood.com/mcp/trading).
+  "SCN-MCP-PILOT-TRADING: fully automatic live OAuth pilot against the
+   Robinhood MCP server (https://agent.robinhood.com/mcp/trading).
 
-   BLOCKED BY DEFAULT: the pilot needs an operator token handoff
-   (RH_MCP_TOKEN, optionally RH_MCP_REFRESH_TOKEN + RH_MCP_CLIENT_ID).
-   Without RH_MCP_TOKEN it prints handoff instructions and exits 2
-   without touching the network. Nothing credential-shaped is persisted:
-   evidence carries digests and redacted metadata only.
+   Default path needs NO token handoff: discover endpoints, register a
+   public client, open the operator browser on the loopback authorization
+   URL, capture the code off-chat, exchange it, persist ONLY the refresh
+   token to the OS keychain, reuse the lingering in-memory access token
+   for a read-only MCP call, then prove refresh works. The operator only
+   completes the browser login; no token is ever pasted, printed, logged,
+   or written to disk. Evidence carries digests and redaction flags only.
+
+   Safety: with --dry-run (or no browser-capable operator step) the pilot
+   prints its plan and exits 2 WITHOUT touching the network. Pass --live
+   to execute. Never commit, print, or log tokens.
 
    Usage:
-     lg -source-paths src:test test/live/mcp_pilot_trading.lg run [--tool NAME --args JSON]
+     lg -source-paths src:test test/live/mcp_pilot_trading.lg run --dry-run
+     lg -source-paths src:test test/live/mcp_pilot_trading.lg run --live [--tool NAME --args JSON] [--timeout-ms N]
 
    With --tool, the pilot additionally calls the explicitly named tool.
-   Name a read-only tool only; the pilot cannot verify server-side
-   side effects. Evidence lands in evidence/mcp-pilot-trading-evidence.edn
-   (or ATTRACTOR_PILOT_EVIDENCE)."
+   Name a read-only tool only. Evidence lands in
+   evidence/mcp-pilot-trading-evidence.edn (or ATTRACTOR_PILOT_EVIDENCE)."
   (:require [clojure.string :as str]
-            [clojure.edn :as edn]
-            [os :as os] [io :as io] [json :as json]
+            [clojure.core :as core]
+            [os :as os] [io :as io] [json :as json] [http :as http]
             [attractor.mcp-client :as mcp-client]
             [attractor.mcp :as mcp]
-            [attractor.providers :as providers]
-            [hash :as hash]))
+            [attractor.auth :as auth]
+            [attractor.providers :as providers]))
 
-(def endpoint "https://agent.robinhood.com/mcp/trading")
-(def token-endpoint "https://api.robinhood.com/oauth2/token/")
+(def resource-url "https://agent.robinhood.com/mcp/trading")
+(def service-id "mcp:robinhood-trading")
 (def evidence-path "evidence/mcp-pilot-trading-evidence.edn")
 
 (defn- env [key]
   (let [value (os/getenv key)]
     (when-not (str/blank? value) value)))
-
-(defn- handoff-and-exit! []
-  (println "MCP pilot blocked: no operator token handoff.")
-  (println "Steps:")
-  (println "  1. Complete the browser OAuth authorization-code + PKCE step out of band")
-  (println "     (scope: internal; public client via dynamic registration).")
-  (println "  2. export RH_MCP_TOKEN=<access-token>")
-  (println "     optionally export RH_MCP_REFRESH_TOKEN=<refresh-token> RH_MCP_CLIENT_ID=<client-id>")
-  (println "     for the refresh proof (token endpoint shown above).")
-  (println "  3. Re-run this pilot. Tokens stay in process memory only.")
-  (println "Nothing was sent over the network.")
-  (os/exit 2))
 
 (defn- find-arg-val [args flag]
   (loop [remaining args]
@@ -49,74 +43,132 @@
           (= (first remaining) flag) (second remaining)
           :else (recur (rest remaining)))))
 
-(defn- handshake-journey [token]
+(defn- flag? [args flag]
+  (boolean (some #(= flag %) args)))
+
+(defn- open-browser! [url]
+  ;; Accepted exposure: the URL carries single-use state/challenge on the
+   ;; local process argv (never tokens). Best-effort detached launch.
+  (doseq [command [["open" url] ["xdg-open" url]]]
+    (try (core/future (apply os/sh command))
+         (catch Object _ nil)))
+  nil)
+
+(defn- dry-run-plan [args]
+  (println "MCP pilot dry run: no network touched.")
+  (println "Live plan (--live executes it):")
+  (println "  1. RFC 9728 discovery against the resource server")
+  (println "  2. RFC 7591 dynamic public-client registration")
+  (println "  3. PKCE + 127.0.0.1 loopback listener, browser authorization URL")
+  (println "  4. Code capture off-chat, single exchange, refresh to OS keychain")
+  (println (str "  5. Read-only MCP handshake at " resource-url))
+  (when (find-arg-val args "--tool")
+    (println (str "  6. Explicit read-only tool call: " (find-arg-val args "--tool"))))
+  (println "  7. Refresh proof from the in-memory refresh token")
+  (println "Tokens stay in process memory except the keychain refresh entry.")
+  (os/exit 2))
+
+(def write-like-prefixes
+  "Heuristic verb blocklist for the pilot --tool gate. Membership in
+   tools/list is required first; this second gate refuses names shaped
+   like mutations. It is heuristic, not a side-effect proof: the
+   operator remains responsible for naming a read-only tool."
+  ["place_" "create_" "delete_" "update_" "write_" "submit_" "cancel_"
+   "transfer_" "buy_" "sell_" "order_" "trade_" "execute_" "modify_"
+   "remove_" "send_" "withdraw_" "deposit_" "approve_" "set_" "post_"])
+
+(defn- check-tool-gate! [tools tool-name]
+  (let [names (into #{} (map #(get % "name") tools))]
+    (when-not (contains? names tool-name)
+      (throw (ex-info (str "Tool not advertised by server: " tool-name)
+                      {:category :pilot-tool-not-advertised :tool tool-name})))
+    (let [lower (str/lower-case (str tool-name))]
+      (doseq [prefix write-like-prefixes]
+        (when (str/starts-with? lower prefix)
+          (throw (ex-info (str "Tool name looks mutating, refused: " tool-name)
+                          {:category :pilot-tool-looks-mutating :tool tool-name})))))
+    tool-name))
+
+(defn- handshake-journey [token tool-name args-json]
   (let [started (System/currentTimeMillis)
         handle (mcp-client/open-session
-                 {:endpoint endpoint :timeout-ms 20000
+                 {:endpoint resource-url :timeout-ms 20000
                   :headers {"authorization" (str "Bearer " token)}})]
     (try
       (let [listed (mcp-client/session-request! handle "tools/list" {})
-            tools (get (:result listed) "tools")]
+            tools (get (:result listed) "tools")
+            tool-result
+            (when-not (str/blank? (or tool-name ""))
+              (check-tool-gate! tools tool-name)
+              (let [called (mcp-client/session-request!
+                             handle "tools/call"
+                             {:name tool-name
+                              :arguments (if (str/blank? (or args-json ""))
+                                           {}
+                                           (json/read-json args-json))})]
+                {:tool tool-name
+                 :result-digest (hash/sha256 (mcp/extract-text (:result called)))}))]
         {:status :pass
          :mode (:mode listed)
          :tool-count (count tools)
          :tool-names (mapv #(get % "name") tools)
+         :tool-call tool-result
          :duration-ms (- (System/currentTimeMillis) started)})
       (finally (mcp-client/close-session! handle)))))
 
-(defn- tool-journey [token tool-name args-json]
-  (let [handle (mcp-client/open-session
-                 {:endpoint endpoint :timeout-ms 20000
-                  :headers {"authorization" (str "Bearer " token)}})]
-    (try
-      (let [arguments (if (str/blank? (or args-json ""))
-                        {}
-                        (json/read-json args-json))
-            out (mcp-client/session-request!
-                  handle "tools/call" {:name tool-name :arguments arguments})
-            text (mcp/extract-text (:result out))]
-        {:status :pass :tool tool-name
-         :result-digest (hash/sha256 text)
-         :result-bytes (count (bytes text))})
-      (finally (mcp-client/close-session! handle)))))
+(defn- keychain-refresh-for-proof [service-id token-host]
+  (try
+    ((:fetch (auth/osxkeychain-store)) {:host token-host :username service-id})
+    (catch Object _ nil)))
 
-(defn- refresh-journey [refresh-token client-id]
-  (if (or (str/blank? refresh-token) (str/blank? client-id))
-    {:status :skipped :reason :refresh-unconfigured}
+(defn- refresh-journey [token-endpoint client-id service-id]
+  (let [refresh-token (keychain-refresh-for-proof service-id "api.robinhood.com")]
+    (if (or (str/blank? refresh-token) (str/blank? client-id))
+      {:status :skipped :reason :refresh-unconfigured}
     (let [fresh (mcp/refresh-access-token nil token-endpoint client-id refresh-token
                                           {:timeout-ms 20000})]
       {:status (if (and (map? fresh)
                         (not (str/blank? (:access-token fresh))))
                  :pass :fail)
-       :expires-in (:expires-in fresh)})))
-
-(defn- run-row [name f]
-  (let [started (System/currentTimeMillis)]
-    (try (merge {:journey name} (f))
-         (catch Object error
-           {:journey name :status :fail
-            :category (:category (ex-data error))
-            :duration-ms (- (System/currentTimeMillis) started)}))))
+       :expires-in (:expires-in fresh)}))))
 
 (defn -main [& args]
-  (let [token (env "RH_MCP_TOKEN")]
-    (when (nil? token)
-      (handoff-and-exit!))
-    (let [rows [(run-row :handshake (fn [] (handshake-journey token)))
-                (run-row :refresh (fn [] (refresh-journey (env "RH_MCP_REFRESH_TOKEN")
-                                                          (env "RH_MCP_CLIENT_ID"))))]
-          tool-name (find-arg-val args "--tool")
-          rows (if (str/blank? (or tool-name ""))
-                 rows
-                 (conj rows (run-row :tool-call
-                                     (fn [] (tool-journey token tool-name
-                                                          (find-arg-val args "--args"))))))
-          evidence {:scenario "SCN-MCP-PILOT-TRADING"
+  (when-not (flag? args "--live")
+    (dry-run-plan args))
+  (let [timeout-ms (or (try (parse-long (find-arg-val args "--timeout-ms"))
+                            (catch Object _ nil))
+                       600000)
+        flow (auth/authorize
+               http/request resource-url
+               {:token-endpoint "https://api.robinhood.com/oauth2/token/"
+                :scope "internal"}
+               {:service-id service-id
+                :store (auth/osxkeychain-store)
+                :timeout-ms timeout-ms
+                :on-url (fn [url]
+                          (println "Open this URL to authorize (browser opening attempted):")
+                          (println url)
+                          (open-browser! url)
+                          nil)})
+        token (:access-token flow)
+        rows [(merge {:journey :handshake}
+                     (try (handshake-journey token (find-arg-val args "--tool")
+                                            (find-arg-val args "--args"))
+                          (catch Object error
+                            {:status :fail :category (:category (ex-data error))})))
+              (merge {:journey :refresh}
+                     (try (refresh-journey "https://api.robinhood.com/oauth2/token/"
+                                           (:client-id flow) service-id)
+                          (catch Object error
+                            {:status :fail :category (:category (ex-data error))})))]]
+    (println "Authorization complete; access token lives in process memory only.")
+    (let [evidence {:scenario "SCN-MCP-PILOT-TRADING"
                     :recorded_at (str (System/currentTimeMillis))
-                    :endpoint endpoint
+                    :service-id service-id
+                    :refresh-stored (:refresh-stored flow)
+                    :expires-in (:expires-in flow)
                     :rows rows}
-          redacted (providers/redact evidence [(env "RH_MCP_TOKEN")
-                                                (env "RH_MCP_REFRESH_TOKEN")])]
+          redacted (providers/redact evidence [token])]
       (io/mkdir "evidence")
       (io/spit (or (env "ATTRACTOR_PILOT_EVIDENCE") evidence-path) (pr-str redacted))
       (doseq [row rows] (prn (dissoc row :detail)))

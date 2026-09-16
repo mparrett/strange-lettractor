@@ -1,0 +1,337 @@
+(ns attractor.auth-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [hash :as hash]
+            [io :as io]
+            [os :as os]
+            [json :as json]
+            [net :as net]
+            [attractor.auth :as auth]))
+
+;; ---------------------------------------------------------------------------
+;; PKCE.
+;; ---------------------------------------------------------------------------
+
+(deftest pkce-verifier-shape
+  (let [v1 (auth/pkce-verifier)
+        v2 (auth/pkce-verifier)]
+    (is (= 64 (count v1)))
+    (is (some? (re-matches #"[0-9a-fA-F]+" v1)))
+    (is (not (= v1 v2)))))
+
+;; Challenge vector cross-checked against Python hashlib (RFC 7636
+;; Appendix B shape): S256 of the example verifier, base64url, no pad.
+(deftest pkce-challenge-matches-known-vector
+  (if (auth/openssl-available?)
+    (is (= "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+           (auth/pkce-challenge "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")))
+    (do (println "SKIP pkce vector: openssl unavailable")
+        (is true))))
+
+(deftest pkce-challenge-run-failure-fails-closed
+  (let [err (try (auth/pkce-challenge "abc" (fn [_] (throw (ex-info "no openssl" {}))))
+                 (catch Object e e))]
+    (is (= :auth-pkce-unavailable (:category (ex-data err))))))
+
+(deftest authorization-url-carries-required-parameters
+  (let [url (auth/authorization-url
+              {:authorization-endpoint "https://auth.example/o"
+               :client-id "cid" :redirect-uri "http://127.0.0.1:9/callback"
+               :scope "internal" :state "st" :code-challenge "ch"})]
+    (doseq [fragment ["response_type=code" "client_id=cid" "state=st"
+                      "code_challenge=ch" "code_challenge_method=S256"]]
+      (is (str/includes? url fragment) fragment))))
+
+;; ---------------------------------------------------------------------------
+;; Credential store (injected runner).
+;; ---------------------------------------------------------------------------
+
+(defn- recording-runner [responses]
+  (let [calls (atom [])]
+    {:calls calls
+     :run (fn [argv stdin-text]
+            (swap! calls conj {:argv argv :stdin stdin-text})
+            (let [response (get responses (last argv) {:exit 0 :out "" :err ""})]
+              response))}))
+
+(deftest secure-store-keeps-secret-out-of-argv
+  (let [{:keys [calls run]} (recording-runner {})
+        store (auth/osxkeychain-store {:run-command run})]
+    ((:store store) {:host "api.example" :username "mcp:trading" :secret "S3CR3T-refresh"})
+    (let [call (last @calls)]
+      (is (= ["git" "credential-osxkeychain" "store"] (:argv call)))
+      (is (str/includes? (:stdin call) "password=S3CR3T-refresh"))
+      (is (str/includes? (:stdin call) "username=mcp:trading"))
+      (is (not (str/includes? (str/join " " (:argv call)) "S3CR3T"))))))
+
+(deftest secure-fetch-parses-password-and-miss-yields-nil
+  (let [{:keys [run]} (recording-runner
+                        {"get" {:exit 0 :out "protocol=https\nhost=api.example\nusername=mcp:trading\npassword=tok-r\n\n" :err ""}})
+        store (auth/osxkeychain-store {:run-command run})]
+    (is (= "tok-r" ((:fetch store) {:host "api.example" :username "mcp:trading"}))))
+  (let [{:keys [run]} (recording-runner {"get" {:exit 0 :out "" :err ""}})
+        store (auth/osxkeychain-store {:run-command run})]
+    (is (nil? ((:fetch store) {:host "api.example" :username "mcp:trading"})))))
+
+(deftest store-transport-errors-fail-closed
+  (let [{:keys [run]} (recording-runner {})
+        boom {:run-command (fn [_ _] (throw (ex-info "no helper" {})))}
+        store (auth/osxkeychain-store boom)]
+    (doseq [op [(:store store) (:fetch store) (:erase store)]]
+      (let [err (try (op {:host "h" :username "u" :secret "s"}) (catch Object e e))]
+        (is (= :auth-store-failed (:category (ex-data err)))))))
+  (let [{:keys [run]} (recording-runner
+                        {"get" {:exit 1 :out "" :err "denied"}})
+        store (auth/osxkeychain-store {:run-command run})]
+    (let [err (try ((:fetch store) {:host "h" :username "u"}) (catch Object e e))]
+      (is (= :auth-store-failed (:category (ex-data err)))))))
+
+;; ---------------------------------------------------------------------------
+;; Discovery, registration, exchange (fake transports).
+;; ---------------------------------------------------------------------------
+
+(defn- fake-discovery-transport [calls]
+  (fn [request]
+    (swap! calls conj request)
+    (let [url (:url request)]
+      (cond (str/includes? url "oauth-protected-resource")
+            {:status 200 :headers {"content-type" "application/json"}
+             :body (json/write-json {:authorization_servers ["https://auth.example"]
+                                     :scopes_supported ["internal"]})}
+            (str/includes? url "openid-configuration")
+            {:status 200 :headers {"content-type" "application/json"}
+             :body (json/write-json {:authorization_endpoint "https://auth.example/o"
+                                     :token_endpoint "https://api.example/t/"
+                                     :registration_endpoint "https://api.example/reg"
+                                     :code_challenge_methods_supported ["S256"]
+                                     :token_endpoint_auth_methods_supported ["none"]})}
+            :else {:status 404 :headers {} :body "no"}))))
+
+(deftest discovery-resolves-endpoints-and-reports-methods
+  (let [calls (atom [])
+        endpoints (auth/resolve-endpoints
+                    (fake-discovery-transport calls) "https://api.example/mcp/trading" {})]
+    (is (= "https://auth.example/o" (:authorization-endpoint endpoints)))
+    (is (= "https://api.example/t/" (:token-endpoint endpoints)))
+    (is (= "https://api.example/reg" (:registration-endpoint endpoints))))
+  (testing "explicit endpoints skip discovery without network"
+    (let [calls (atom [])
+          endpoints (auth/resolve-endpoints
+                      (fn [request] (swap! calls conj request) (throw (ex-info "no network" {})))
+                      "https://api.example/x"
+                      {:authorization-endpoint "https://auth.example/o"
+                       :token-endpoint "https://api.example/t/"})]
+      (is (= "https://auth.example/o" (:authorization-endpoint endpoints)))
+      (is (= 0 (count @calls))))))
+
+(deftest registration-returns-client-id-never-secret
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 201 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:client_id "cid-9"})})
+        result (auth/register-client transport "https://api.example/reg"
+                                     "test-client" "http://127.0.0.1:9/callback" "internal")]
+    (is (= "cid-9" (:client-id result)))
+    (is (= 1 (count @calls))))
+  (testing "secret-issuing server is refused without returning the value"
+    (let [result (try (auth/register-client
+                        (fn [_] {:status 201 :headers {"content-type" "application/json"}
+                                 :body (json/write-json {:client_id "cid-9" :client_secret "shh"})})
+                        "https://api.example/reg" "t" "http://127.0.0.1:9/callback" "internal")
+                      (catch Object e e))]
+      (is (= :auth-registration-conflict (:category (ex-data result))))))
+  (testing "rejected registration fails closed"
+    (let [err (try (auth/register-client
+                     (fn [_] {:status 400 :headers {} :body "no"})
+                     "https://api.example/reg" "t" "http://127.0.0.1:9/callback" "internal")
+                   (catch Object e e))]
+      (is (= :auth-registration-failed (:category (ex-data err)))))))
+
+(deftest exchange-happens-exactly-once-per-code
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 200 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:access_token "tok-a" :refresh_token "tok-r"
+                                             :expires_in 3600})})
+        first (auth/exchange-code
+                transport "https://api.example/t/" "code-1"
+                "http://127.0.0.1:9/callback" "cid" "verifier")]
+    (is (= "tok-a" (:access-token first)))
+    (is (= "tok-r" (:refresh-token first)))
+    (is (= 3600 (:expires-in first)))
+    (is (= 1 (count @calls)))))
+
+;; ---------------------------------------------------------------------------
+;; Loopback listener (real localhost sockets, no credentials).
+;; ---------------------------------------------------------------------------
+
+(defn- raw-get [port target]
+  (let [connection (net/dial "127.0.0.1" port)]
+    (net/write! connection (str "GET " target " HTTP/1.1\r\nHost: h\r\n\r\n"))
+    (let [raw (net/read! connection 8192)
+          buf (io/buffer)]
+      (.Write buf raw)
+      (let [text (io/buffer-str buf)]
+        (net/close! connection)
+        text))))
+
+(deftest listener-captures-matching-code-and-rejects-rest
+  (let [server (auth/start-listener "st-1" {:port 0 :timeout-ms 5000})]
+    (try
+      (let [port (:port server)]
+        (is (pos? port))
+        ;; Wrong state: 400, ignored.
+        (is (str/includes? (raw-get port "/callback?code=BAD&state=nope") "400"))
+        ;; Wrong path: 404, ignored.
+        (is (str/includes? (raw-get port "/other?code=BAD&state=st-1") "404"))
+        ;; Correct capture.
+        (is (str/includes? (raw-get port "/callback?code=CODE-1&state=st-1") "200"))
+        (let [captured (auth/await-code! server 2000)]
+          (is (= "CODE-1" (:code captured))))
+        ;; Duplicate after capture: server closed the capture, ignored.
+        (is (= 1 (:captured-count @(:state-atom server)))))
+      (finally (auth/close-code-listener! server)))))
+
+(deftest listener-times-out-cleanly
+  (let [server (auth/start-listener "st-1" {:port 0 :timeout-ms 200})]
+    (try
+      (let [err (try (auth/await-code! server 1000) (catch Object e e))]
+        (is (= :auth-timeout (:category (ex-data err)))))
+      (finally (auth/close-code-listener! server)))))
+
+;; ---------------------------------------------------------------------------
+;; Full authorize orchestration with fakes.
+;; ---------------------------------------------------------------------------
+
+(defn- fake-oauth-transport [calls]
+  (fn [request]
+    (swap! calls conj request)
+    (let [url (:url request)]
+      (cond (str/includes? url "oauth2/token")
+            (let [body (str (:body request))]
+              (if (str/includes? body "grant_type=authorization_code")
+                {:status 200 :headers {"content-type" "application/json"}
+                 :body (json/write-json {:access_token "tok-access-1"
+                                         :refresh_token "tok-refresh-1"
+                                         :expires_in 3600})}
+                {:status 200 :headers {"content-type" "application/json"}
+                 :body (json/write-json {:access_token "tok-access-2"
+                                         :expires_in 3600})}))
+            :else {:status 400 :headers {} :body "unexpected"}))))
+
+(deftest authorize-handoff-persists-only-refresh
+  (let [calls (atom [])
+        stored (atom [])
+        store {:store (fn [entry] (swap! stored conj entry) nil)
+               :fetch (fn [_] nil)
+               :erase (fn [_] nil)}
+        flow (auth/authorize
+               (fake-oauth-transport calls)
+               "https://api.example/mcp/trading"
+               {:authorization-endpoint "https://auth.example/o"
+                :token-endpoint "https://api.example/oauth2/token/"
+                :scope "internal" :client-id "cid-1"}
+               {:service-id "mcp:trading"
+                :store store
+                :timeout-ms 8000
+                :pkce-run (fn [_] "fake-challenge")
+                :on-url (fn [url]
+                          (let [port (parse-long (second (re-find #"127\.0\.0\.1%3a(\d+)" url)))
+                                state (second (re-find #"state=([^&\s]+)" url))
+                                connection (net/dial "127.0.0.1" port)]
+                            (net/write! connection
+                                        (str "GET /callback?code=CODE-9&state=" state
+                                             " HTTP/1.1\r\nHost: h\r\n\r\n"))
+                            (net/read! connection 4096)
+                            (net/close! connection)
+                            nil))})]
+    (is (some? (:access-token flow)))
+    (is (= 3600 (:expires-in flow)))
+    ;; Exactly one refresh write, access never persisted.
+    (is (= 1 (count @stored)))
+    (is (= "tok-refresh-1" (:secret (first @stored))))
+    (is (= "mcp:trading" (:username (first @stored))))
+    ;; Evidence carries no values.
+    (is (not (str/includes? (pr-str (:flow-evidence flow)) "tok-")))
+    (is (not (str/includes? (pr-str (:flow-evidence flow)) "CODE-9")))
+    (is (true? (:refresh-stored flow)))))
+
+(deftest listener-rejects-blank-expected-state
+  (let [err (try (auth/start-listener "" {:port 0}) (catch Object e e))]
+    (is (= :auth-configuration (:category (ex-data err)))))
+  (let [err (try (auth/start-listener nil {:port 0}) (catch Object e e))]
+    (is (= :auth-configuration (:category (ex-data err))))))
+
+(deftest discovered-http-endpoints-refused
+  (let [transport (fn [request]
+                    (let [url (:url request)]
+                      (if (str/includes? url "oauth-protected-resource")
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (json/write-json {:authorization_servers ["https://auth.example"]})}
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (json/write-json {:authorization_endpoint "https://auth.example/o"
+                                                 :token_endpoint "http://api.example/t/"
+                                                 :token_endpoint_auth_methods_supported ["none"]})})))
+        err (try (auth/resolve-endpoints transport "https://api.example/x" {})
+                 (catch Object e e))]
+    (is (= :auth-endpoint-not-https (:category (ex-data err))))))
+
+(deftest confidential-method-refused-before-listener
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    (let [url (:url request)]
+                      (if (str/includes? url "oauth-protected-resource")
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (json/write-json {:authorization_servers ["https://auth.example"]})}
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (json/write-json {:authorization_endpoint "https://auth.example/o"
+                                                 :token_endpoint "https://api.example/t/"
+                                                 :token_endpoint_auth_methods_supported ["client_secret_basic"]})})))
+        err (try (auth/authorize transport "https://api.example/x" {}
+                                 {:service-id "s" :timeout-ms 1000})
+                 (catch Object e e))]
+    (is (= :auth-policy-mismatch (:category (ex-data err))))
+    ;; No listener side effects needed: failure precedes any browser step.
+    (is (= 2 (count @calls)))))
+
+(deftest exchange-error-carries-code-not-content
+  (let [err (try (auth/exchange-code
+                   (fn [_] {:status 400 :headers {"content-type" "application/json"}
+                            :body (json/write-json {:error {:code "bad"
+                                                            :description "reflected <secret>"}})})
+                   "https://api.example/t/" "c" "http://127.0.0.1:9/callback" "cid" "v")
+                 (catch Object e e))]
+    (is (= :auth-exchange-failed (:category (ex-data err))))
+    (is (= "bad" (:error-code (ex-data err))))
+    (is (not (str/includes? (pr-str (ex-data err)) "reflected")))))
+
+(deftest token-host-keeps-explicit-ports
+  (is (= "api.example:8443" (auth/token-host "https://api.example:8443/oauth2/token/")))
+  (is (= "api.example" (auth/token-host "https://api.example/oauth2/token/"))))
+
+(deftest discovery-issuer-must-be-https
+  (let [calls (atom [])
+        transport (fn [request]
+                    (swap! calls conj request)
+                    {:status 200 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:authorization_servers ["http://auth.example"]})})
+        err (try (auth/resolve-endpoints transport "https://api.example/x" {})
+                 (catch Object e e))]
+    (is (= :auth-endpoint-not-https (:category (ex-data err))))))
+
+(deftest listener-closes-after-capture
+  (let [server (auth/start-listener "st-9" {:port 0 :timeout-ms 5000})
+        port (:port server)
+        connection (net/dial "127.0.0.1" port)]
+    (try
+      (net/write! connection "GET /callback?code=C9&state=st-9 HTTP/1.1\r\nHost: h\r\n\r\n")
+      (net/read! connection 4096)
+      (net/close! connection)
+      (is (= "C9" (:code (auth/await-code! server 2000))))
+      (let [refused (try (net/dial "127.0.0.1" port) (catch Object e :refused))]
+        (is (= :refused refused)))
+      (finally (auth/close-code-listener! server)))))

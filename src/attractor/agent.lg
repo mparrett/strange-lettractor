@@ -441,7 +441,9 @@
                                  :file-exists (:file-exists skill-access)
                                  :list-dir (:list-dir skill-access)
                                  :approvals mcp-approvals
-                                 :token-reader (fn [name] (os/getenv name))))]
+                                 :token-reader (fn [name] (os/getenv name))
+                                 :oauth-authorizer (:mcp_oauth_authorizer options)
+                                 :credential-store (:mcp_credential_store options)))]
           (emit-event! session {:type :mcp_admitted
                                 :servers (:servers admission)
                                 :config_digest (:config-digest admission)})))

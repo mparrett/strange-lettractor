@@ -490,12 +490,14 @@
   (let [bounds (or opts {})
         sender (or transport http/request)
         outcome (capacity/call!
-                  (fn [] (sender {:method :post :url token-endpoint
-                                     :headers {"content-type" "application/x-www-form-urlencoded"
-                                               "accept" "application/json"}
-                                     :body (form-body [["grant_type" "refresh_token"]
-                                                       ["refresh_token" refresh-token]
-                                                       ["client_id" client-id]])}))
+                  (fn []
+                    (sender {:method :post
+                             :url token-endpoint
+                             :headers {"content-type" "application/x-www-form-urlencoded"
+                                       "accept" "application/json"}
+                             :body (form-body [["grant_type" "refresh_token"]
+                                               ["refresh_token" refresh-token]
+                                               ["client_id" client-id]])}))
                   {:timeout_ms (or (:timeout-ms bounds) 10000)
                    :aborted? (:aborted? bounds)})
         response (if (and (map? outcome) (= :unavailable (:status outcome)))
@@ -514,9 +516,9 @@
 
 (defn perform-registration
   "Perform dynamic client registration against a public-client endpoint.
-   Returns {:client-id} plus :credential-issued when the server also
-   returns a secret, whose value is NEVER returned or stored by the
-   harness; the operator handles it out of band."
+   Returns {:client-id}. Fails closed with :auth-registration-conflict
+   when the server issues a secret against auth method none: the value
+   is NEVER returned or stored by the harness."
   [transport registration-endpoint client-metadata]
   (let [response (try
                    (transport {:method :post :url registration-endpoint
@@ -533,9 +535,10 @@
                       (fail! :mcp-protocol-error {:reason :registration-malformed})))]
       (when-not (non-blank-string? (get body "client_id"))
         (fail! :mcp-protocol-error {:reason :registration-without-client-id}))
-      (cond-> {:client-id (get body "client_id")}
-        (non-blank-string? (get body "client_secret"))
-        (assoc :credential-issued true)))))
+      (when (non-blank-string? (get body "client_secret"))
+        (fail! :auth-registration-conflict
+               {:reason :server-issued-secret-for-public-client}))
+      {:client-id (get body "client_id")})))
 
 ;; ---------------------------------------------------------------------------
 ;; Result text, labels, and audit.
@@ -610,14 +613,15 @@
   30000)
 
 (defn- track-token!
-  "Record a live access token and its optional expiry in the per-server
-   token state. expires-in-secs may be nil (unknown expiry: reuse until
-   a 401 says otherwise). Values stay in this atom only, never in logs."
-  [server-ctx token expires-in-secs]
+  "Record a live access token, its optional expiry, and origin in the
+   per-server token state. A nil origin preserves the existing one.
+   Values stay in this atom only, never in logs."
+  [server-ctx token expires-in-secs & [origin]]
   (let [expires-at (when (integer? expires-in-secs)
                      (+ (System/currentTimeMillis) (* 1000 (max 0 expires-in-secs))))]
-    (reset! (:token-state server-ctx) {:token token :expires-at-ms expires-at}))
-  token)
+    (reset! (:token-state server-ctx) {:token token :expires-at-ms expires-at
+                                       :origin (or origin (:origin @(:token-state server-ctx)))})
+    token))
 
 (defn- refresh-configured? [server-ctx]
   (let [manifest (:manifest server-ctx)]
@@ -635,12 +639,37 @@
         (do (core/sleep 5)
             (recur))))))
 
+(defn- refresh-material [server-ctx]
+  "Current refresh material as {:token :origin} or nil: explicit env
+   first, then the keychain entry for this service identity."
+  (let [manifest (:manifest server-ctx)
+        refresh-env (:refresh-token-env manifest)
+        reader (:token-reader server-ctx)
+        env-token (when (and (non-blank-string? refresh-env) (some? reader))
+                    (reader refresh-env))]
+    (cond (non-blank-string? env-token)
+          {:token env-token :origin "environment"}
+
+          (and (non-blank-string? refresh-env)
+               (non-blank-string? (:token-endpoint manifest))
+               (some? (:credential-store server-ctx)))
+          (let [service-id (str "mcp:" (:id manifest))
+                host (auth/token-host (str (:token-endpoint manifest)))
+                store (:credential-store server-ctx)
+                stored (try ((:fetch store) {:host host :username service-id})
+                            (catch Object error
+                              (fail! :auth-store-failed
+                                     {:server_id (:id manifest)
+                                      :reason :keychain-unavailable})))]
+            (when (non-blank-string? stored)
+              {:token stored :origin "keychain"})))))
+
 (defn- try-refresh-locked! [server-ctx]
   "Refresh body; caller must hold the server refresh lock so headers
    and token state update atomically with respect to other refreshers."
   (let [manifest (:manifest server-ctx)
-        reader (:token-reader server-ctx)
-        refresh-token (when reader (reader (:refresh-token-env manifest)))]
+        material (refresh-material server-ctx)
+        refresh-token (:token material)]
     (when (str/blank? (str refresh-token))
       (fail! :mcp-auth-failed {:server (:id manifest) :reason :no-refresh-token}))
     (let [fresh (refresh-access-token (:transport server-ctx)
@@ -651,7 +680,8 @@
                                        :aborted? (:aborted? server-ctx)})]
       (mcp-client/set-headers! (:handle server-ctx)
                                (auth-headers (:access-token fresh)))
-      (track-token! server-ctx (:access-token fresh) (:expires-in fresh))
+      (track-token! server-ctx (:access-token fresh) (:expires-in fresh)
+                      (:origin material))
       (:access-token fresh))))
 
 
@@ -674,25 +704,36 @@
    Without refresh configuration an expired token is used as-is and
    left to fail closed."
   [server-ctx]
-  (let [token-env (:token-env (:manifest server-ctx))]
-    (if-not (non-blank-string? token-env)
-      {:reused true}
-      (if-not (token-expired? server-ctx)
+  (let [manifest (:manifest server-ctx)
+        token-env (:token-env manifest)
+        cached (:token @(:token-state server-ctx))]
+    (if (and (str/blank? (str cached))
+             (non-blank-string? (:refresh-token-env manifest))
+             (non-blank-string? (:token-endpoint manifest)))
+      (with-refresh-lock! server-ctx
+        (fn []
+          (if (str/blank? (str (:token @(:token-state server-ctx))))
+            (do (try-refresh-locked! server-ctx)
+                {:reused false})
+            {:reused true})))
+      (if-not (non-blank-string? token-env)
         {:reused true}
-        (with-refresh-lock! server-ctx
-          (fn []
-            (if (token-expired? server-ctx)
-              (do (try-refresh-locked! server-ctx)
-                  {:reused false})
-              {:reused true})))))))
+        (if-not (token-expired? server-ctx)
+          {:reused true}
+          (with-refresh-lock! server-ctx
+            (fn []
+              (if (token-expired? server-ctx)
+                (do (try-refresh-locked! server-ctx)
+                    {:reused false})
+                {:reused true}))))))))
 (defn- refreshable? [server-ctx error]
   (and (= :mcp-auth-failed (:category (ex-data error)))
        (non-blank-string? (:refresh-token-env (:manifest server-ctx)))
        (non-blank-string? (:token-endpoint (:manifest server-ctx)))
        (some? (:token-reader server-ctx))))
 
-(defn- default-oauth-authorizer [transport endpoint overrides]
-  (auth/authorize transport endpoint overrides))
+(defn- default-oauth-authorizer [transport endpoint descriptor opts]
+  (auth/authorize transport endpoint descriptor opts))
 
 (defn- oauth-capable? [server-ctx error]
   (and (= :mcp-auth-failed (:category (ex-data error)))
@@ -712,8 +753,11 @@
                           :authorization-url (:authorization-url manifest)
                           :registration-url (:registration-endpoint manifest)
                           :scope (:scope manifest)
-                          :service-id (:id manifest)})]
-            (track-token! server-ctx (:access-token tokens) (:expires-in tokens))
+                          :client-id (:client-id manifest)}
+                         {:service-id (str "mcp:" (:id manifest))
+                          :store (:credential-store server-ctx)})]
+            (track-token! server-ctx (:access-token tokens) (:expires-in tokens)
+                          "oauth-handoff")
             (mcp-client/set-headers! (:handle server-ctx)
                                      (auth-headers (:access-token tokens)))
             tokens))))))
@@ -753,12 +797,13 @@
 
                             (oauth-capable? server-ctx error)
                             (try
-                              (run-oauth-handoff! server-ctx expected-token)
-                              (reset! refreshed-this-call true)
-                              (reset! oauth-this-call true)
-                              {:status :ok
-                               :response (mcp-client/session-request!
-                                           (:handle server-ctx) method params)}
+                              (let [handoff (run-oauth-handoff! server-ctx expected-token)]
+                                (reset! refreshed-this-call true)
+                                (reset! oauth-this-call true)
+                                {:status :ok
+                                 :response (mcp-client/session-request!
+                                             (:handle server-ctx) method params)
+                                 :oauth-evidence (:flow-evidence handoff)})
                               (catch Object oauth-error
                                 {:status :error :error oauth-error}))
 
@@ -776,10 +821,12 @@
               :args-digest (hash/sha256 (pr-str params))
               :timeout-ms (get-in manifest [:limits :timeout-ms])
                      :token-source (:token-env manifest)
+                     :token-origin (:origin @(:token-state server-ctx))
                      :token-reused (boolean (and (:reused (:freshness outcome))
                                               (not @refreshed-this-call)))
                      :token-expires-at (:expires-at-ms @(:token-state server-ctx))
                      :oauth-authorized @oauth-this-call
+                     :oauth-evidence (:oauth-evidence outcome)
               :received-at received-at
               :latency-ms (- received-at t0)}]
     (if (= :ok (:status outcome))
@@ -811,20 +858,45 @@
    :description (str (:description tool) " [mcp:" server-id "]")
    :parameters (or (:schema tool) {:type "object"})})
 
-(defn- admit-one-server [session resolved token-reader transport oauth-authorizer]
+(defn- keychain-refresh-for [store server-id manifest]
+  "Read a stored refresh token for a service identity. Returns the
+   token or nil when absent. Helper failures throw :auth-store-failed
+   instead of degrading silently into re-handoff loops."
+  (let [service-id (str "mcp:" server-id)
+        host (auth/token-host (str (:token-endpoint manifest)))]
+    (try ((:fetch store) {:host host :username service-id})
+         (catch Object error
+           (fail! :auth-store-failed {:server_id server-id :reason :keychain-unavailable})))))
+
+(defn- admit-one-server [session resolved token-reader transport oauth-authorizer credential-store]
   (let [manifest (:manifest resolved)
         server-id (:id manifest)
         stdio? (stdio-transport? manifest)
         token-env (:token-env manifest)
+        refresh-env (:refresh-token-env manifest)
         reader (or token-reader (fn [name] (os/getenv name)))
-        token (when (non-blank-string? token-env) (reader token-env))]
-    (if (and (non-blank-string? token-env) (str/blank? (str token)))
+        token (when (non-blank-string? token-env) (reader token-env))
+        env-refresh (when (non-blank-string? refresh-env) (reader refresh-env))
+        keychain-refresh (when (and (str/blank? (str env-refresh))
+                                    (non-blank-string? refresh-env)
+                                    (non-blank-string? (:token-endpoint manifest))
+                                    (some? credential-store))
+                           (keychain-refresh-for credential-store server-id manifest))
+        refresh-available? (or (non-blank-string? env-refresh)
+                               (non-blank-string? keychain-refresh))
+        origin (cond (non-blank-string? (str token)) "environment"
+                     (non-blank-string? env-refresh) "environment"
+                     (non-blank-string? keychain-refresh) "keychain")]
+    (if (and (non-blank-string? token-env)
+             (str/blank? (str token))
+             (not refresh-available?))
       (fail! :mcp-auth-missing {:server_id server-id
                                :token_env token-env
                                :hint (str "export " token-env
                                           " with a handoff token; values never enter the repo")})
-      ;; When no token-env and no token configured, check for OAuth support
-      (when (and (str/blank? (str token-env))
+      ;; Without usable tokens, OAuth-capable manifests proceed to first-401 handoff.
+      (when (and (str/blank? (str token))
+                 (not refresh-available?)
                  (or (:registration-endpoint manifest) (:authorization-url manifest)))
         (println (str "[mcp] " server-id ": no token configured, OAuth will trigger on first 401."))))
     (let [registry (get-in @session [:provider_profile :tool_registry])
@@ -855,10 +927,12 @@
                         :endpoint (:endpoint manifest)
                         :timeout-ms timeout-ms
                         :aborted? aborted?
-                        :headers (auth-headers token)}))
+                         :headers (if (str/blank? (str token))
+                                     {}
+                                     (auth-headers token))}))
             server-ctx {:manifest manifest
                         :manifest-digest (:manifest-digest resolved)
-                        :token-state (atom {:token token :expires-at-ms nil})
+                        :token-state (atom {:token token :expires-at-ms nil :origin origin})
                         :refresh-lock (atom false)
                         :transport-kind (if stdio? :stdio :streamable-http)
                         :timeout-ms timeout-ms
@@ -873,7 +947,8 @@
                         :transport transport
                         :oauth-authorizer (or oauth-authorizer default-oauth-authorizer)
                         :token-reader (or token-reader
-                                          (fn [name] (os/getenv name)))}
+                                          (fn [name] (os/getenv name)))
+                        :credential-store credential-store}
             tool-entries
             (mapv (fn [tool]
                     (let [tool-name (str server-id "__" (:name tool))]
@@ -940,7 +1015,7 @@
    {:servers [...] :config-digest ...}. Every failure is fail-closed."
   [session selected-ids opts]
   (let [{:keys [project-root user-root read-text file-exists approvals
-                transport token-reader oauth-authorizer]} (or opts {})]
+                transport token-reader oauth-authorizer credential-store]} (or opts {})]
     (when-not (and (vector? selected-ids) (seq selected-ids)
                    (every? non-blank-string? selected-ids))
       (fail! :mcp-selection-invalid {:reason :ids-must-be-non-empty-strings}))
@@ -958,7 +1033,7 @@
     (let [resolved (mapv #(resolve-one % {:project-root project-root :user-root user-root}
                                        read-text file-exists (or approvals {}))
                          selected-ids)
-          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer) resolved)
+          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer credential-store) resolved)
           config-digest (mcp-config-digest (map :evidence admitted))]
       (swap! session assoc :mcp_servers (mapv :evidence admitted))
       (swap! session assoc :mcp_config_digest config-digest)
