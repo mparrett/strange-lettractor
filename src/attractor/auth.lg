@@ -217,7 +217,7 @@
           auth-url (str authz-url "?"
                        (str/join "&" (map (fn [[k v]] (str k "=" (url-encode v)))
                                           [["response_type" "code"]
-                                           ["client_id" client-id]
+                                           ["client_id" reg-id]
                                            ["redirect_uri" full-redirect]
                                            ["scope" scope]
                                            ["state" state]
@@ -236,6 +236,6 @@
         (when (not= (:state callback) state)
           (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
 
-        (let [tokens (exchange-code transport token-url client-id full-redirect (:code callback) verifier)]
+        (let [tokens (exchange-code transport token-url reg-id full-redirect (:code callback) verifier)]
           (println "Authorization complete.")
           tokens)))))

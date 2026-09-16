@@ -114,7 +114,7 @@
                      (catch Object e e))]
         (is (= :mcp-manifest-invalid (:category (ex-data err))) (str "case: " label))))))
 
-(defn- make-session-with-mcp [roots requests server-ids transport token-reader]
+(defn- make-session-with-mcp [roots requests server-ids transport token-reader & [extra]]
   (let [profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
         session (agent/make-session
                   {:provider_profile profile :execution_env (journey-env)
@@ -122,7 +122,7 @@
                    :complete_fn (fn [request]
                                   (swap! requests conj request)
                                   {:message {:role :assistant :content "done"} :tool_calls []})})]
-    (mcp/admit-servers! session server-ids (base-opts roots transport token-reader))
+    (mcp/admit-servers! session server-ids (merge (base-opts roots transport token-reader) extra))
     session))
 
 
@@ -288,6 +288,44 @@
                      (get-in @session [:provider_profile :tool_registry]) "demo__quote")
               err (try ((:executor tool) {:symbol "AAA"} nil) (catch Object e e))]
           (is (= :mcp-auth-failed (:category (ex-data err)))))
+        (finally (agent/close-session! session))))))
+
+(deftest oauth-handoff-happens-automatically-on-first-401
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo"
+                     (-> (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
+                         (dissoc :token-env)
+                         (assoc :registration-endpoint "https://api.example/register"
+                                :scope "internal")))
+    (let [calls (atom []) handoffs (atom [])
+          transport (fn [request]
+                      (swap! calls conj request)
+                      (if (= "Bearer oauth-token-2"
+                             (get (:headers request) "authorization"))
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (rpc-result (request-id request)
+                                           {:content [{:type "text" :text "ok"}]})}
+                        {:status 401 :headers {} :body "expired"}))
+          authorizer (fn [endpoint-transport endpoint overrides]
+                       (swap! handoffs conj {:endpoint endpoint :overrides overrides})
+                       {:access-token "oauth-token-2" :expires-in 3600})
+          requests (atom [])
+          session (make-session-with-mcp roots requests ["demo"] transport
+                                         (fn [_] nil)
+                                         {:oauth-authorizer authorizer})]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              first-output ((:executor tool) {:symbol "AAA"} nil)
+              second-output ((:executor tool) {:symbol "AAA"} nil)
+              entry (last @(:mcp_evidence @session))]
+          (is (str/includes? first-output "ok"))
+          (is (str/includes? second-output "ok"))
+          (is (= 1 (count @handoffs)))
+          (is (= "https://m.example/mcp" (:endpoint (first @handoffs))))
+          (is (= "demo" (get-in (first @handoffs) [:overrides :service-id])))
+          (is (some true? (mapv :oauth-authorized @(:mcp_evidence @session))))
+          (is (not (str/includes? (pr-str entry) "oauth-token-2"))))
         (finally (agent/close-session! session))))))
 
 (deftest unavailable-server-never-yields-empty-success

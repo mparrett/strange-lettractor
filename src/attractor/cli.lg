@@ -26,7 +26,6 @@
             [attractor.providers :as providers]
             [attractor.skills :as skills]
             [attractor.mcp :as mcp]
-            [attractor.auth :as auth]
             [attractor.skill-eval :as skill-eval]
             [clojure.core :as core]
             [clojure.edn :as edn]))
@@ -835,29 +834,8 @@
             (if (= :divergent (:cross-root found))
               (do (println (str "MCP manifest for " id " differs across project and user roots; record an approval before use."))
                   (os/exit 1))
-              (let [manifest (:manifest found)
-                    endpoint (or (:endpoint manifest) (str (:registration-endpoint manifest)))
-                    explicit-overrides {:token-url (:token-url manifest)
-                                       :authorization-url (:authorization-url manifest)
-                                       :registration-url (:registration-endpoint manifest)
-                                       :client-id (:client-id manifest)
-                                       :scope (:scope manifest)
-                                       :service-id id}]
-                (if (or (:token-url manifest) (:endpoint manifest))
-                  (try
-                    (let [tokens (auth/authorize http/request
-                                   (or (:endpoint manifest) (:registration-endpoint manifest))
-                                   explicit-overrides)]
-                      (println (str "Tokens acquired for " id "."))
-                      (println (str "  access: " (count (:access-token tokens)) " chars"))
-                      (println (str "  refresh: " (count (:refresh-token tokens)) " chars"))
-                      (println (str "  expires: " (:expires-in tokens) "s"))
-                      (os/exit 0))
-                    (catch Object e
-                      (println (str "Authorization failed: " (.getMessage e)))
-                      (os/exit 1)))
-                  (do (println (mcp/authorize-guidance manifest))
-                      (os/exit 0)))))
+              (do (println (mcp/authorize-guidance (:manifest found)))
+                  (os/exit 0)))
             (do (println (if (= :invalid found)
                            (str "MCP manifest invalid for server: " id)
                            (str "Unknown MCP server: " (or id ""))))
