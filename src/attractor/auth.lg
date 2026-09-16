@@ -221,8 +221,11 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- bounded-call [transport request timeout-ms]
-  (let [outcome (capacity/call! (fn [] (transport request))
-                                {:timeout_ms (or timeout-ms default-timeout-ms)})]
+  ;; capacity/call! accepts 1..60000ms; the authorize flow timeout may be
+  ;; larger (browser wait), so clamp per-request HTTP timeouts here.
+  (let [per-request-ms (min 60000 (max 1 (or timeout-ms default-timeout-ms)))
+        outcome (capacity/call! (fn [] (transport request))
+                                {:timeout_ms per-request-ms})]
     (if (and (map? outcome) (= :unavailable (:status outcome)))
       (fail! :auth-transport-error {:reason (:reason outcome)})
       outcome)))
