@@ -163,10 +163,10 @@
                                           ["code_challenge" challenge]
                                           ["code_challenge_method" "S256"]])))]
 
-    (prn "--- OAuth Authorization Required ---")
-    (prn (str "Open this URL to authorize \"" service-id "\":"))
-    (prn auth-url)
-    (prn "Waiting for callback (300s timeout)...")
+    (println "--- OAuth Authorization Required ---")
+    (println (str "Open this URL to authorize \"" service-id "\":"))
+    (println auth-url)
+    (println "Waiting for callback (300s timeout)...")
     
     (let [callback (deref (:result listener) 300000 :auth-timeout)]
       (net/close! (:server listener))
@@ -175,10 +175,8 @@
       (when (not= (:state callback) state)
         (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
       
-      (println "Code received. Exchanging for tokens...")
       (let [tokens (exchange-code transport token-url client-id
                                   (str/replace redirect-uri ":0" (str ":" port))
                                   (:code callback) verifier)]
-        (println "Authorization complete.")
-        tokens))))
+        tokens)))
 
