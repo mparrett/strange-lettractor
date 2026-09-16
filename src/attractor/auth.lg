@@ -7,6 +7,16 @@
             [io :as io]
             [attractor.context-discovery :as capacity]))
 
+(defn- url-encode [text]
+  "URL-encode a string for query parameters."
+  (let [safe-chars #{\- \_ \~ \.}]
+    (apply str (map (fn [c]
+      (if (or (<= (int \a) (int c) (int \z)) (<= (int \A) (int c) (int \Z))
+              (<= (int \0) (int c) (int \9)) (contains? safe-chars c))
+        (str c)
+        (format "%%%02x" (int c))))
+                    text))))
+
 ;;; OAuth 2.0 authorization-code + PKCE flow, RFC 9728 discovery,
 ;;; RFC 7591 dynamic registration, loopback listener, keychain storage,
 ;;; and token refresh. Protocol-neutral: works for MCP, REST APIs, etc.
@@ -34,7 +44,7 @@
   "Fetch unauthenticated protected-resource metadata. Returns a map or throws."
   [transport resource-url]
   (let [resp (transport {:method :get :url (str resource-url "/.well-known/oauth-protected-resource/") :headers {"accept" "application/json"}})
-        body (json/parse (:body resp))]
+        body (json/read-json (:body resp))]
     (when-not (:authorization_servers body)
       (throw (ex-info "Missing authorization_servers in resource metadata" {:category :auth-discovery-failed})))
     body))
@@ -50,7 +60,7 @@
                  :token_endpoint_auth_method "none" :scope scope}
         resp (transport {:method :post :url registration-url :body (json/write-json payload)
                          :headers {"content-type" "application/json" "accept" "application/json"}})
-        body (json/parse (:body resp))]
+        body (json/read-json (:body resp))]
     (when (and (contains? body :client_secret) (not (str/blank? (:client_secret body))))
       (throw (ex-info "Server issued a client secret but auth method is :none" {:category :auth-registration-conflict})))
     {:client-id (:client_id body)}))
@@ -89,27 +99,86 @@
 
 ;; ─── Authorize flow ────────────────────────────────────────────────
 
+
+(defn- compute-challenge [verifier]
+  "PKCE S256 challenge via openssl pipeline: SHA-256 then base64url."
+  (let [proc (os/sh "openssl" "dgst" "-sha256" "-binary")
+        _ (io/write! (:stdin proc) verifier)
+        _ (io/close! (:stdin proc))
+        raw (str/trim (:stdout proc))
+        b64 (if (str/blank? raw)
+              (throw (ex-info "openssl pipeline failed" {:category :auth-pkce-failed}))
+              raw)]
+    (str/replace (str/replace b64 #"\\+" "") #"=+$" "")))
+
+(defn- build-auth-url [client-id redirect-uri scope state challenge]
+  (str "https://robinhood.com/oauth?"
+       (str/join "&" (map (fn [[k v]] (str k "=" v))
+                          [["response_type" "code"]
+                           ["client_id" client-id]
+                           ["redirect_uri" redirect-uri]
+                           ["scope" scope]
+                           ["state" state]
+                           ["code_challenge" challenge]
+                           ["code_challenge_method" "S256"]]))))
+
+(defn- exchange-code [transport token-url client-id redirect-uri code verifier]
+  (let [body (str/join "&" (map (fn [[k v]] (str k "=" v))
+                                [["grant_type" "authorization_code"]
+                                 ["code" code]
+                                 ["redirect_uri" redirect-uri]
+                                 ["client_id" client-id]
+                                 ["code_verifier" verifier]]))
+        resp (transport {:method :post :url token-url
+                         :headers {"content-type" "application/x-www-form-urlencoded"}
+                         :body body})
+        data (json/read-json (:body resp))]
+    (when (:error data)
+      (throw (ex-info (str "Token exchange failed: " (:error data))
+                      {:category :auth-exchange-failed :error-data data})))
+    {:access-token (:access_token data)
+     :refresh-token (:refresh_token data)
+     :expires-in (:expires_in data)}))
+
 (defn authorize
-  "Full OAuth authorization-code + PKCE flow:
-   1. Discover authorization and token endpoints
-   2. Register client (unless already registered)
-   3. Open loopback listener
-   4. Build and print the authorization URL
-   5. Wait for the redirect code
-   6. Exchange for tokens
-   7. Return {:access-token :refresh-token :expires-in}
+  "Full OAuth authorization-code + PKCE flow. Opens a loopback listener,
+   prints the authorization URL, waits for the redirect, exchanges the
+   code for tokens, and returns {:access-token :refresh-token :expires-in}.
    Never writes tokens to files, logs, or evidence."
-  [transport {:keys [resource-url registration-url authorization-url token-url
-                     client-id scope service-id] :as config}]
+  [transport {:keys [authorization-url token-url client-id scope service-id]
+              :or {scope "internal"}}]
   (let [redirect-uri "http://127.0.0.1:0/"
         verifier (pkce-verifier)
-        challenge (let [r (core/sh "openssl" "dgst" "-sha256" "-binary")
-                        _ (io/write! (:stdin r) verifier)
-                        (io/close! (:stdin r))
-                        raw (:stdout r)]
-                    (core/sh "base64" nil nil {:stdin raw}))
-        ;; Actually let's use a simpler approach for the challenge
-        _ (prn "Authorization flow for" service-id)
-        _ (prn "Opening browser at: <url>")))
-  ;; Stub — full implementation in next turn
-  {:access-token nil :refresh-token nil :expires-in nil})
+        challenge (compute-challenge verifier)
+        state (pkce-verifier)
+        listener (start-listener 300000)
+        port (:port listener)
+        auth-url (str "https://robinhood.com/oauth?"
+                      (str/join "&" (map (fn [[k v]] (str k "=" (url-encode v)))
+                                         [["response_type" "code"]
+                                          ["client_id" client-id]
+                                          ["redirect_uri" (str/replace redirect-uri ":0" (str ":" port))]
+                                          ["scope" scope]
+                                          ["state" state]
+                                          ["code_challenge" challenge]
+                                          ["code_challenge_method" "S256"]])))]
+
+    (prn "--- OAuth Authorization Required ---")
+    (prn (str "Open this URL to authorize \"" service-id "\":"))
+    (prn auth-url)
+    (prn "Waiting for callback (300s timeout)...")
+    
+    (let [callback (deref (:result listener) 300000 :auth-timeout)]
+      (net/close! (:server listener))
+      (when (= callback :auth-timeout)
+        (throw (ex-info "Authorization timed out" {:category :auth-timeout})))
+      (when (not= (:state callback) state)
+        (throw (ex-info "State mismatch - possible CSRF" {:category :auth-state-mismatch})))
+      
+      (println "Code received. Exchanging for tokens...")
+      (let [tokens (exchange-code transport token-url client-id
+                                  (str/replace redirect-uri ":0" (str ":" port))
+                                  (:code callback) verifier)]
+        (println "Authorization complete.")
+        tokens))))
+
