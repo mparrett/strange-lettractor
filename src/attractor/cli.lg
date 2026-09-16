@@ -26,6 +26,7 @@
             [attractor.providers :as providers]
             [attractor.skills :as skills]
             [attractor.mcp :as mcp]
+            [attractor.auth :as auth]
             [attractor.skill-eval :as skill-eval]
             [clojure.core :as core]
             [clojure.edn :as edn]))
@@ -834,8 +835,22 @@
             (if (= :divergent (:cross-root found))
               (do (println (str "MCP manifest for " id " differs across project and user roots; record an approval before use."))
                   (os/exit 1))
-              (do (println (mcp/authorize-guidance (:manifest found)))
-                  (os/exit 0)))
+              (let [manifest (:manifest found)
+                    token-url (:token-url manifest)
+                    client-id (:client-id manifest)
+                    authz-url (:authorization-url manifest)]
+                (if (and token-url client-id)
+                  (try
+                    (println (str "Starting OAuth authorize for " id "..."))
+                    (let [tokens (auth/authorize http/request {:token-url token-url :client-id client-id
+                                                               :authorization-url authz-url :service-id id})]
+                      (println (str "Tokens acquired for " id "."))
+                      (os/exit 0))
+                    (catch Object e
+                      (println (str "Authorization failed: " (.getMessage e)))
+                      (os/exit 1)))
+                  (do (println (mcp/authorize-guidance manifest))
+                      (os/exit 0)))))
             (do (println (if (= :invalid found)
                            (str "MCP manifest invalid for server: " id)
                            (str "Unknown MCP server: " (or id ""))))
