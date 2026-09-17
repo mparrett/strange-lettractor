@@ -519,3 +519,13 @@
                   :file-exists (fn [p] (some? (os/stat p)))}]
       (is (= entry (skills/read-approvals (:read-text access) (:file-exists access) path)))
       (is (= {} (skills/revoke-approval entry "demo"))))))
+
+(deftest blank-attractor-home-falls-back-to-home
+  ;; An unset variable reads as "" on this runtime, so blank must not win.
+  (let [previous (os/getenv "ATTRACTOR_HOME")]
+    (os/setenv "ATTRACTOR_HOME" "")
+    (try
+      (is (= (str (os/getenv "HOME") "/.attractor/skills") (skills/user-skills-root)))
+      (is (str/starts-with? (str (skills/default-approvals-path))
+                            (str (os/getenv "HOME") "/.attractor/")))
+      (finally (os/setenv "ATTRACTOR_HOME" (or previous ""))))))

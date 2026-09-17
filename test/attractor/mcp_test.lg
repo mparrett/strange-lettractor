@@ -1025,3 +1025,13 @@
           (is (str/includes? output "ok"))
           (is (= "keychain" (:token-origin entry))))
         (finally (agent/close-session! session))))))
+
+(deftest blank-attractor-home-falls-back-to-home
+  ;; An unset variable reads as "" on this runtime, so blank must not win.
+  (let [previous (os/getenv "ATTRACTOR_HOME")]
+    (os/setenv "ATTRACTOR_HOME" "")
+    (try
+      (is (= (str (os/getenv "HOME") "/.attractor/mcp") (mcp/user-mcp-root)))
+      (is (= (str (os/getenv "HOME") "/.attractor/mcp-approvals.edn")
+             (mcp/default-approvals-path)))
+      (finally (os/setenv "ATTRACTOR_HOME" (or previous ""))))))

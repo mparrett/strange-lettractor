@@ -75,21 +75,26 @@
   [git-root working-dir]
   (str (or git-root working-dir) "/.attractor/skills"))
 
+(defn home-base
+  "Directory that holds .attractor: $ATTRACTOR_HOME, else $HOME. An unset
+   variable reads as blank on this runtime, so blank never shadows $HOME."
+  []
+  (some #(when (non-blank-string? %) %)
+        [(os/getenv "ATTRACTOR_HOME") (os/getenv "HOME")]))
+
 (defn user-skills-root
   "User skill root, honouring $ATTRACTOR_HOME before $HOME. Nil when neither
    is set, in which case only the project root is consulted."
   []
-  (let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
-    (when (non-blank-string? base)
-      (str base "/.attractor/skills"))))
+  (when-let [base (home-base)]
+    (str base "/.attractor/skills")))
 
 (defn default-approvals-path
   "User-level file holding sticky cross-root approvals. Nil when no home
    base is configured."
   []
-  (when-let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
-    (when (non-blank-string? base)
-      (str base "/.attractor/" approvals-file-name))))
+  (when-let [base (home-base)]
+    (str base "/.attractor/" approvals-file-name)))
 
 (defn local-file-access
   "Real-filesystem accessors for the CLI and for tests that use temp dirs."

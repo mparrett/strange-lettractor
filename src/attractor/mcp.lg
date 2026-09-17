@@ -86,14 +86,12 @@
   (str (or git-root working-dir) "/.attractor/mcp"))
 
 (defn user-mcp-root []
-  (let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
-    (when (and (string? base) (not (str/blank? base)))
-      (str base "/.attractor/mcp"))))
+  (when-let [base (skills/home-base)]
+    (str base "/.attractor/mcp")))
 
 (defn default-approvals-path []
-  (when-let [base (or (os/getenv "ATTRACTOR_HOME") (os/getenv "HOME"))]
-    (when (and (string? base) (not (str/blank? base)))
-      (str base "/.attractor/" approvals-file-name))))
+  (when-let [base (skills/home-base)]
+    (str base "/.attractor/" approvals-file-name)))
 
 (defn read-default-approvals [access]
   (skills/read-approvals (:read-text access) (:file-exists access)

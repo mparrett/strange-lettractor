@@ -353,12 +353,14 @@
                                          repo-git-root repo-working-dir))
                      :user-root (or (:user_mcp_root options)
                                     (mcp/user-mcp-root))}
-          mcp-approvals (if (contains? options :mcp_approvals)
-                          (or (:mcp_approvals options) {})
-                          (mcp/read-default-approvals skill-access))
-          skill-approvals (if (contains? options :skill_approvals)
-                            (or (:skill_approvals options) {})
-                            (skills/read-default-approvals skill-access))
+          ;; Approvals only arbitrate selected ids; a session that selects
+          ;; nothing must not depend on the user's approvals files.
+          mcp-approvals (cond (contains? options :mcp_approvals) (or (:mcp_approvals options) {})
+                              (seq selected-mcp) (mcp/read-default-approvals skill-access)
+                              :else {})
+          skill-approvals (cond (contains? options :skill_approvals) (or (:skill_approvals options) {})
+                                (seq selected-skills) (skills/read-default-approvals skill-access)
+                                :else {})
           skill-result (when (seq selected-skills)
                          (skills/load-selected
                            selected-skills
