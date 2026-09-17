@@ -1,0 +1,8 @@
+# Build context is the sources lgx bundles plus the runtime patches; nothing
+# generated, nothing local.
+*
+!Dockerfile
+!lgx.edn
+!main.lg
+!src/
+!runtime-patches/
