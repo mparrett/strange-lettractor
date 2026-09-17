@@ -21,10 +21,6 @@ LGX := lgx
 TINY_TUI := $(firstword $(wildcard $(HOME)/.lgx/gitlibs/github.com/abogoyavlensky/tiny-tui/*/src))
 SOURCE_PATHS := src:test$(if $(TINY_TUI),:$(TINY_TUI))
 RUNNER := test/runner.lg
-# Seconds the full suite may run; the harness enforces it (exit 124) and
-# names the test that was running. Live scripts carry their own defaults
-# and accept --deadline-ms.
-TIMEOUT ?= 1500
 
 TEST_FILES := $(wildcard test/attractor/*_test.lg)
 
@@ -51,8 +47,8 @@ build: check-runtime ## Build bin/attractor (removes the old binary first; macOS
 	rm -f bin/attractor
 	$(LGX) build
 
-test: check-runtime ## Full suite through the project harness, which owns its deadline (about four minutes)
-	"$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) --all --deadline-ms $$(( $(TIMEOUT) * 1000 ))
+test: check-runtime ## Full suite through lgx (about three minutes)
+	$(LGX) test
 
 suite: test ## Alias for test
 

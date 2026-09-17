@@ -17,8 +17,8 @@ export LGX_LG="$HOME/development/let-go/lg"
 ### Build & Verify
 
 ```bash
-# 1. Run the test suite (the harness enforces its own deadline)
-make test
+# 1. Run the test suite
+lgx test
 
 # 2. Compile the standalone binary
 lgx build

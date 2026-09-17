@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [clojure.core :as core]
+            [harness.deadline :as deadline]
             [async :as async]
             [attractor.fan-in-llm :as ranker]
             [attractor.llm :as llm]
@@ -193,10 +194,10 @@
                   (fn [sent]
                     (deliver entered true)
                     (try
-                      (loop []
-                        (when-not ((get-in sent [:abort_signal :aborted?]))
-                          (core/sleep 2)
-                          (recur)))
+                      ;; Bounded: if cancellation never arrives the provider
+                      ;; returns and the assertions below fail, rather than
+                      ;; this thread spinning forever.
+                      (deadline/wait-until (get-in sent [:abort_signal :aborted?]) 10000)
                       (finally
                         (deliver cleanup-entered true)
                         (deref release 1000 nil)

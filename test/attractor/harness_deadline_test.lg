@@ -25,7 +25,19 @@
          (deadline/split-args ["a.ns" "--deadline-ms" "5000" "b.ns"] 900000)))
   (is (= {:timeout-ms 900000 :args ["run" "--live"]}
          (deadline/split-args ["run" "--live"] 900000)))
+  ;; No flag and no default means no deadline.
+  (is (= {:timeout-ms nil :args ["a.ns"]} (deadline/split-args ["a.ns"] nil)))
   ;; A deadline nobody can read is a bug, not "no deadline".
   (is (= :invalid-deadline
          (:category (ex-data (try (deadline/split-args ["--deadline-ms" "soon"] 1)
                                   (catch Object e e)))))))
+
+(deftest wait-until-returns-as-soon-as-the-condition-holds
+  (let [flag (atom false)]
+    (core/future (core/sleep 30) (reset! flag true))
+    (is (true? (deadline/wait-until (fn [] @flag) 2000)))))
+
+(deftest wait-until-gives-up-at-its-bound-instead-of-spinning
+  (let [started (System/currentTimeMillis)]
+    (is (false? (deadline/wait-until (fn [] false) 60)))
+    (is (< (- (System/currentTimeMillis) started) 1500))))

@@ -1,8 +1,11 @@
 (ns harness.deadline
-  "Whole-run deadline owned by the test harness itself. A watchdog future
-   ends a run that outlives its budget and says what was running, so no
-   caller has to wrap the process in an external alarm. It fires even
-   while the main thread is busy; exit code 124 matches timeout(1)."
+  "A deadline for runs that need one: the live network journeys, and the
+   runner when chasing a hang. A watchdog future ends a run that outlives
+   its budget and says what was running, so nothing wraps the process in
+   an external alarm. It fires even while the main thread is busy; exit
+   code 124 matches timeout(1).
+
+   The suite has no blanket deadline. A test that can hang bounds itself."
   (:require [clojure.core :as core]
             [clojure.string :as str]
             [os :as os]))
@@ -11,7 +14,8 @@
 (def poll-ms 25)
 
 (defn split-args
-  "Pull `--deadline-ms N` out of args. Returns {:timeout-ms :args}."
+  "Pull `--deadline-ms N` out of args. Returns {:timeout-ms :args};
+   :timeout-ms is default-ms (possibly nil: no deadline) when absent."
   [args default-ms]
   (loop [remaining (seq args) kept [] timeout-ms default-ms]
     (cond
@@ -23,6 +27,19 @@
                           {:category :invalid-deadline :value (second remaining)})))
         (recur (nnext remaining) kept parsed))
       :else (recur (next remaining) (conj kept (first remaining)) timeout-ms))))
+
+(defn wait-until
+  "Poll pred until it holds or timeout-ms passes. Returns whether it held.
+   For test doubles that wait on the code under test (a cancellation, a
+   release): if that never comes, the double gives up and the test fails
+   on its assertion instead of spinning forever."
+  [pred timeout-ms]
+  (let [give-up (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (>= (System/currentTimeMillis) give-up) false
+        :else (do (core/sleep 2) (recur))))))
 
 (defn- exit-on-timeout [{:keys [timeout-ms running]}]
   (println)

@@ -1,20 +1,19 @@
 (ns main
-  "The project's test harness. Runs test namespaces in one process, each
-   test var under its fixtures, with the harness's own deadline:
+  "Focused test runner: test namespaces in one process, each test var
+   under its fixtures. The full suite is `lgx test`.
      lg -source-paths src:test test/runner.lg attractor.providers-test [more...]
-     lg -source-paths src:test test/runner.lg --all [--deadline-ms N] [--verbose]
+     lg -source-paths src:test test/runner.lg --all [--verbose]
    Output: one line per failing test with its detail, then a summary
-   (--verbose lists passing tests too). Exits 0 on success, 1 on failure,
-   and 124 when the deadline passes, naming the test that was running, so
-   callers need no external timeout wrapper."
+   (--verbose lists passing tests too). Exits 0 on success, 1 on failure.
+
+   There is no default deadline: a test that can hang bounds itself.
+   `--deadline-ms N` is for chasing a hang: past N the run exits 124 and
+   names the test that was running."
   (:require [test :refer [*registered-tests* *report-counters*
                           *test-result* *each-fixtures*]]
             [clojure.string :as str]
             [os :as os]
             [harness.deadline :as deadline]))
-
-(def default-deadline-ms 600000)
-(def suite-deadline-ms 1500000)
 
 (defn- all-test-namespaces []
   (->> (str/split (str (:out (os/sh "ls" "test/attractor"))) #"\n")
@@ -52,14 +51,14 @@
         all? (boolean (some #(= "--all" %) raw-args))
         verbose? (boolean (some #(= "--verbose" %) raw-args))
         {:keys [timeout-ms args]} (deadline/split-args
-                                    (remove flags raw-args)
-                                    (if all? suite-deadline-ms default-deadline-ms))
+                                    (remove flags raw-args) nil)
         names (if all? (all-test-namespaces) args)]
     (when (empty? names)
       (println "usage: test/runner.lg <namespace> [namespace...] | --all   [--deadline-ms N] [--verbose]")
       (os/exit 2))
     (let [running (atom "startup")
-          watch (deadline/start! {:timeout-ms timeout-ms :describe (fn [] @running)})]
+          watch (when timeout-ms
+                  (deadline/start! {:timeout-ms timeout-ms :describe (fn [] @running)}))]
       ;; Probes required by a test run their own -main when *command-line-args*
       ;; is non-empty; the runner's arguments are not theirs.
       (binding [*command-line-args* nil]
@@ -75,7 +74,7 @@
                         (doseq [line (detail-lines out)] (println (str "    " line)))
                         (when error (println (str "    ERROR: " error))))
             verbose? (println (str "✓ " n "/" (var-name test-var))))))
-      ((:cancel! watch))
+      (when watch ((:cancel! watch)))
       (let [counters *report-counters*
             failures (+ (:fail counters) (:error counters))]
         (prn counters)

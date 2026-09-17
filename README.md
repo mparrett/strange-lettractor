@@ -23,7 +23,7 @@ does both, in let-go:
 | "Build your own software factory" | `bin/attractor run`, `console`, `agent`, `serve` | [tutorial](docs/tutorial.md), [behavior corpus](docs/superpowers/iterations/behavior-corpus.md) |
 
 The ledgers and audits distinguish tested behavior from remaining requirements;
-the full suite is `make test` (the project harness, `test/runner.lg --all`, which enforces its own deadline). Native-provider live coverage and full schema
+the full suite is `lgx test` (`make test`). Native-provider live coverage and full schema
 conformance remain incomplete. See the [current specification audit](docs/original-spec-status.md)
 for verified results and remaining gaps. Historical story counts alone do not
 establish full specification conformance.
@@ -82,7 +82,7 @@ so always set it:
 export LGX_LG=/path/to/let-go/build/lg   # the fixed local build
 lgx install                              # fetches tiny-tui (pinned in lgx.edn)
 lgx build                                # bin/attractor
-make test                                # full suite via test/runner.lg (~4 min, own deadline)
+lgx test                                 # full suite (~3 min)
 bin/attractor help
 ```
 
