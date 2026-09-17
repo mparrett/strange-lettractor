@@ -222,8 +222,11 @@
     (when-not (and (non-blank-string? (:token-endpoint manifest))
                    (str/starts-with? (str (:token-endpoint manifest)) "https://"))
       (fail! :mcp-manifest-invalid {:server_id id :reason :refresh-needs-https-token-endpoint}))
-    (when-not (non-blank-string? (:client-id manifest))
-      (fail! :mcp-manifest-invalid {:server_id id :reason :refresh-needs-client-id})))
+    ;; :client-id is optional: a dynamically registered client has no id
+    ;; until the first handoff, which stores it beside the refresh token.
+    (when (some? (:client-id manifest))
+      (when-not (non-blank-string? (:client-id manifest))
+        (fail! :mcp-manifest-invalid {:server_id id :reason :client-id-must-be-a-string}))))
   manifest)
 
 (defn- validate-manifest! [manifest id]
@@ -480,7 +483,7 @@
 
 (defn refresh-access-token
   "Exchange a refresh token for a fresh access token. Returns
-   {:access-token :expires-in} for memory-only use. The exchange runs
+   {:access-token :expires-in :refresh-token} for memory-only use. The exchange runs
    bounded (timeout plus optional abort) so a hung endpoint cannot stall
    a session; worker errors stay redacted. Fails closed with
    :mcp-auth-failed; nothing is written anywhere."
@@ -509,8 +512,12 @@
                       (fail! :mcp-auth-failed {:reason :refresh-malformed})))]
       (when-not (non-blank-string? (get body "access_token"))
         (fail! :mcp-auth-failed {:reason :refresh-without-token}))
+      ;; A rotating server invalidates the presented refresh token; the
+      ;; caller must persist :refresh-token when present or lose the grant.
       {:access-token (get body "access_token")
-       :expires-in (get body "expires_in")})))
+       :expires-in (get body "expires_in")
+       :refresh-token (when (non-blank-string? (get body "refresh_token"))
+                        (get body "refresh_token"))})))
 
 (defn perform-registration
   "Perform dynamic client registration against a public-client endpoint.
@@ -662,6 +669,36 @@
             (when (non-blank-string? stored)
               {:token stored :origin "keychain"})))))
 
+(defn- keychain-entry [server-ctx username]
+  {:host (auth/token-host (str (:token-endpoint (:manifest server-ctx))))
+   :username username})
+
+(defn- refresh-client-id [server-ctx]
+  "Client id for the refresh grant: the manifest's when declared, else
+   the id the last handoff stored beside the refresh token."
+  (let [manifest (:manifest server-ctx)
+        store (:credential-store server-ctx)]
+    (if (non-blank-string? (:client-id manifest))
+      (:client-id manifest)
+      (when (some? store)
+        (try ((:fetch store)
+              (keychain-entry server-ctx
+                              (auth/client-id-username (str "mcp:" (:id manifest)))))
+             (catch Object error
+               (fail! :auth-store-failed
+                      {:server_id (:id manifest) :reason :keychain-unavailable})))))))
+
+(defn- persist-rotated-refresh! [server-ctx material rotated]
+  "Write a rotated refresh token back where the old one came from. Only
+   keychain material is ours to replace; an env-supplied token belongs
+   to the operator."
+  (when (and (non-blank-string? rotated)
+             (= "keychain" (:origin material))
+             (not= rotated (:token material)))
+    ((:store (:credential-store server-ctx))
+     (assoc (keychain-entry server-ctx (str "mcp:" (:id (:manifest server-ctx))))
+            :secret rotated))))
+
 (defn- try-refresh-locked! [server-ctx]
   "Refresh body; caller must hold the server refresh lock so headers
    and token state update atomically with respect to other refreshers."
@@ -670,12 +707,16 @@
         refresh-token (:token material)]
     (when (str/blank? (str refresh-token))
       (fail! :mcp-auth-failed {:server (:id manifest) :reason :no-refresh-token}))
-    (let [fresh (refresh-access-token (:transport server-ctx)
+    (let [client-id (refresh-client-id server-ctx)
+          _ (when (str/blank? (str client-id))
+              (fail! :mcp-auth-failed {:server (:id manifest) :reason :no-client-id}))
+          fresh (refresh-access-token (:transport server-ctx)
                                       (:token-endpoint manifest)
-                                      (:client-id manifest)
+                                      client-id
                                       refresh-token
                                       {:timeout-ms (:timeout-ms server-ctx)
                                        :aborted? (:aborted? server-ctx)})]
+      (persist-rotated-refresh! server-ctx material (:refresh-token fresh))
       (mcp-client/set-headers! (:handle server-ctx)
                                (auth-headers (:access-token fresh)))
       (track-token! server-ctx (:access-token fresh) (:expires-in fresh)

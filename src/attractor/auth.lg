@@ -546,6 +546,12 @@
         end (or (str/index-of after "/") (count after))]
     (subs after 0 end)))
 
+(defn client-id-username
+  "Credential-store username holding the client id a service's stored
+   refresh token is bound to."
+  [service-id]
+  (str service-id ":client-id"))
+
 (defn authorize
   "Full OAuth authorization-code + PKCE handoff for one service.
    descriptor: {:authorization-endpoint :token-endpoint
@@ -636,6 +642,12 @@
                                    ((:store store) {:host (token-host (:token-endpoint endpoints))
                                                     :username service-id
                                                     :secret refresh-token})
+                                   ;; A refresh token only redeems with the client it
+                                   ;; was issued to, and a registered id is new each
+                                   ;; handoff, so a later process needs both.
+                                   ((:store store) {:host (token-host (:token-endpoint endpoints))
+                                                    :username (client-id-username service-id)
+                                                    :secret client-id})
                                    true))
                 completed-at (System/currentTimeMillis)
                 stats @(:state-atom server)]

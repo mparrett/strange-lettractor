@@ -930,6 +930,50 @@
           (is (some? (:token-expires-at entry))))
         (finally (agent/close-session! session))))))
 
+(deftest refresh-returns-rotated-refresh-token
+  (let [transport (fn [_]
+                    {:status 200 :headers {"content-type" "application/json"}
+                     :body (json/write-json {:access_token "tok-a" :expires_in 60
+                                             :refresh_token "tok-refresh-next"})})
+        fresh (mcp/refresh-access-token transport "https://api.example/oauth2/token/"
+                                        "cid" "tok-refresh-old")]
+    (is (= "tok-a" (:access-token fresh)))
+    (is (= "tok-refresh-next" (:refresh-token fresh)))))
+
+(deftest keychain-refresh-persists-rotation-and-reads-stored-client-id
+  (let [roots (make-roots)]
+    ;; A dynamically registered client has no id to put in the manifest.
+    (write-manifest! (:project roots) "demo"
+                     (dissoc (oauth-manifest "https://m.example/mcp") :client-id))
+    (let [token-bodies (atom [])
+          transport (fn [request]
+                      (if (str/includes? (:url request) "oauth2/token")
+                        (do (swap! token-bodies conj (str (:body request)))
+                            {:status 200 :headers {"content-type" "application/json"}
+                             :body (json/write-json {:access_token "tok-keychain-boot"
+                                                     :expires_in 3600
+                                                     :refresh_token "tok-refresh-rotated"})})
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (call-echo request "ok")}))
+          writes (atom [])
+          store (assoc (keychain-store-fake {["api.example" "mcp:demo"] "tok-refresh-kc"
+                                             ["api.example" "mcp:demo:client-id"] "cid-registered"})
+                       :store (fn [entry] (swap! writes conj entry) nil))
+          requests (atom [])
+          session (make-session-with-mcp
+                    roots requests ["demo"] transport (fn [_] nil)
+                    {:credential-store store})]
+      (try
+        (let [tool (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry]) "demo__quote")
+              output ((:executor tool) {:symbol "AAA"} nil)]
+          (is (str/includes? output "ok"))
+          (is (str/includes? (first @token-bodies) "client_id=cid-registered"))
+          (is (= [{:host "api.example" :username "mcp:demo" :secret "tok-refresh-rotated"}]
+                 @writes))
+          (is (not (str/includes? (pr-str @(:mcp_evidence @session)) "tok-refresh"))))
+        (finally (agent/close-session! session))))))
+
 (deftest broken-keychain-helper-fails-closed-at-admission
   (let [roots (make-roots)]
     (write-manifest! (:project roots) "demo" (oauth-manifest "https://m.example/mcp"))

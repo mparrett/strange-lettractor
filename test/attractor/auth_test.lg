@@ -250,10 +250,13 @@
                             nil))})]
     (is (some? (:access-token flow)))
     (is (= 3600 (:expires-in flow)))
-    ;; Exactly one refresh write, access never persisted.
-    (is (= 1 (count @stored)))
+    ;; Refresh plus the client id it is bound to; access never persisted.
+    (is (= 2 (count @stored)))
     (is (= "tok-refresh-1" (:secret (first @stored))))
     (is (= "mcp:trading" (:username (first @stored))))
+    (is (= {:host "api.example" :username "mcp:trading:client-id" :secret "cid-1"}
+           (second @stored)))
+    (is (not (str/includes? (pr-str @stored) "tok-access-1")))
     ;; Evidence carries no values.
     (is (not (str/includes? (pr-str (:flow-evidence flow)) "tok-")))
     (is (not (str/includes? (pr-str (:flow-evidence flow)) "CODE-9")))

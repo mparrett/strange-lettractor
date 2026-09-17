@@ -127,6 +127,12 @@
       {:status :skipped :reason :refresh-unconfigured}
     (let [fresh (mcp/refresh-access-token nil token-endpoint client-id refresh-token
                                           {:timeout-ms 20000})]
+      ;; The proof spends the stored refresh token on a rotating server;
+      ;; keep the replacement or the next process has nothing to redeem.
+      (when-not (str/blank? (str (:refresh-token fresh)))
+        ((:store (auth/osxkeychain-store)) {:host "api.robinhood.com"
+                                            :username service-id
+                                            :secret (:refresh-token fresh)}))
       {:status (if (and (map? fresh)
                         (not (str/blank? (:access-token fresh))))
                  :pass :fail)
