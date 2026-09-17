@@ -805,8 +805,10 @@
   "Execute one admitted MCP tool or resource read. params pass through as
    JSON-RPC params. Returns provenance-labeled text and appends a full
    audit entry (digests, never secrets) to the session :mcp_evidence atom.
-   Failures propagate with :mcp-* categories."
-  [session server-ctx tool-name method params]
+   Failures propagate with :mcp-* categories. {:raw? true} returns the
+   bounded text without the provenance label, for programs that parse it;
+   anything a model reads must keep the label."
+  [session server-ctx tool-name method params & [opts]]
   (let [manifest (:manifest server-ctx)
         server-id (:id manifest)
         max-bytes (get-in manifest [:limits :max-bytes])
@@ -881,7 +883,7 @@
                                    :result-digest (hash/sha256 (:text shaped))
                                    :truncated (:truncated shaped)
                                    :status :ok)))
-        labeled)
+        (if (:raw? opts) (:text shaped) labeled))
       (do (swap! (:mcp_evidence @session) conj
                  (audit-entry (assoc base
                                      :status :error
@@ -1085,3 +1087,46 @@
                                  admitted)))))
       {:servers (mapv :evidence admitted)
        :config-digest config-digest})))
+
+;; ---------------------------------------------------------------------------
+;; Programmatic access.
+;; ---------------------------------------------------------------------------
+
+(defn open-server!
+  "Open one manifest-declared server for a program rather than a model
+   session. Same gates as admission: manifest resolution and approvals,
+   declared tools only, keychain refresh with rotation, OAuth handoff on
+   a first 401, and an audit entry per call. Defaults suit a local CLI
+   (real files, user and cwd roots, OS keychain, real HTTP); opts
+   override any admit-servers! key. Returns {:call! (fn [tool args]) ->
+   raw result text, :evidence (fn []) -> audit entries, :close! (fn [])}."
+  [server-id & [opts]]
+  (let [access (skills/local-file-access)
+        options (merge {:project-root (project-mcp-root nil (os/cwd))
+                        :user-root (user-mcp-root)
+                        :read-text (:read-text access)
+                        :file-exists (:file-exists access)
+                        :transport http/request
+                        :credential-store (auth/osxkeychain-store)}
+                       (or opts {}))
+        approvals (if (contains? options :approvals)
+                    (or (:approvals options) {})
+                    (read-default-approvals access))
+        session (atom {:id (ids/prefixed "mcp-program")
+                       :provider_profile {:tool_registry (profiles/make-tool-registry)}
+                       :mcp_evidence (atom [])})
+        resolved (resolve-one server-id options (:read-text options)
+                              (:file-exists options) approvals)
+        admitted (admit-one-server session resolved (:token-reader options)
+                                   (:transport options) (:oauth-authorizer options)
+                                   (:credential-store options))
+        server-ctx (:server-ctx admitted)
+        declared (into #{} (map :name (:tools (:manifest server-ctx))))]
+    {:call! (fn [tool-name arguments]
+              (when-not (contains? declared tool-name)
+                (fail! :mcp-tool-not-declared {:server_id server-id :tool tool-name}))
+              (mcp-tool-call! session server-ctx tool-name "tools/call"
+                              {:name tool-name :arguments (or arguments {})}
+                              {:raw? true}))
+     :evidence (fn [] @(:mcp_evidence @session))
+     :close! (fn [] (mcp-client/close-session! (:handle server-ctx)))}))

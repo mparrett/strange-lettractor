@@ -1079,3 +1079,29 @@
       (is (= (str (os/getenv "HOME") "/.attractor/mcp-approvals.edn")
              (mcp/default-approvals-path)))
       (finally (os/setenv "ATTRACTOR_HOME" (or previous ""))))))
+
+(deftest open-server-gives-programs-raw-results-under-the-same-gates
+  (let [roots (make-roots)]
+    (write-manifest! (:project roots) "demo" (oauth-manifest "https://m.example/mcp"))
+    (let [payload "{\"next\":\"https://x.example/?a=1&b=<2>\"}"
+          transport (fn [request]
+                      (if (str/includes? (:url request) "oauth2/token")
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (json/write-json {:access_token "tok-prog" :expires_in 3600})}
+                        {:status 200 :headers {"content-type" "application/json"}
+                         :body (call-echo request payload)}))
+          store (keychain-store-fake {["api.example" "mcp:demo"] "tok-refresh-kc"})
+          server (mcp/open-server! "demo" (assoc (base-opts roots transport (fn [_] nil))
+                                                 :credential-store store))]
+      (try
+        ;; Unlabeled and unescaped: a program parses this, no model reads it.
+        (is (= payload ((:call! server) "quote" {:symbol "AAA"})))
+        ;; Only manifest-declared tools exist.
+        (is (= :mcp-tool-not-declared
+               (:category (ex-data (try ((:call! server) "place_order" {})
+                                        (catch Object e e))))))
+        (let [entry (last ((:evidence server)))]
+          (is (= "quote" (:tool entry)))
+          (is (= :ok (:status entry)))
+          (is (not (str/includes? (pr-str entry) "tok-"))))
+        (finally ((:close! server)))))))
