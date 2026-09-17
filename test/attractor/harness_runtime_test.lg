@@ -1,0 +1,19 @@
+(ns attractor.harness-runtime-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [os :as os]
+            [harness.runtime :as runtime]))
+
+(deftest explicit-runtime-wins
+  (with-redefs [os/getenv (fn [key] (when (= key "LGX_LG") "/opt/pinned/lg"))]
+    (is (= "/opt/pinned/lg" (runtime/lg-path)))))
+
+(deftest without-lgx-lg-the-running-runtime-is-used
+  ;; `lgx test` sets no LGX_LG; fixtures must still find a runtime, and an
+  ;; absolute one, because some spawn with an empty environment and no PATH.
+  (let [real-getenv os/getenv]
+    (with-redefs [os/getenv (fn [key] (if (= key "LGX_LG") "" (real-getenv key)))]
+      (let [path (runtime/lg-path)]
+        (is (str/starts-with? path "/"))
+        (is (some? (os/stat path)))
+        (is (= 0 (:exit (os/sh path "-e" "(+ 1 1)"))))))))

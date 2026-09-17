@@ -1,10 +1,11 @@
 (ns attractor.codex-agent-test
-  (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
+  (:require [harness.runtime :as runtime-path]
+            [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
             [attractor.agents.codex :as worker]))
 
 ;; SCN-CODEX-AGENT: one owned app-server turn against the let-go fake child.
 (defn- command [mode]
-  [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+  [(runtime-path/lg-path)
    (str (os/cwd) "/test/fixtures/codex_app_server.lg") mode])
 (defn- attempt [options] (try (worker/run! options) (catch Object e {:error (ex-data e) :message (ex-message e)})))
 

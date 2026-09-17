@@ -1,5 +1,6 @@
 (ns attractor.console-session-test
-  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+  (:require [harness.runtime :as runtime-path]
+            [clojure.test :refer [deftest is]] [clojure.core :as core]
             [clojure.string :as str] [os :as os] [io :as io]
             [attractor.hub :as hub] [attractor.execution :as execution]
             [attractor.profiles :as profiles] [attractor.handlers :as handlers]
@@ -16,9 +17,9 @@
                                                                  :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
                      :project_docs [] :complete_fn answer}
    :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
-   :agent_commands {:claude [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+   :agent_commands {:claude [(runtime-path/lg-path)
                               (str (os/cwd) "/test/fixtures/claude_worker.lg")]
-                     :codex [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                     :codex [(runtime-path/lg-path)
                              (str (os/cwd) "/test/fixtures/codex_app_server.lg")]}
    :allow_agent_scenario true})
 (defn- stop [h] (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))

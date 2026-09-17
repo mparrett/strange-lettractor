@@ -1,18 +1,15 @@
 (ns attractor.claude-agent-test
-  (:require [clojure.test :refer [deftest is]] [attractor.agents.claude :as worker]
+  (:require [harness.runtime :as runtime-path]
+            [clojure.test :refer [deftest is]] [attractor.agents.claude :as worker]
             [attractor.execution :as execution]
             [os :as os] [io :as io] [clojure.string :as str] [clojure.core :as core]))
 (defn opts [scenario]
   {:prompt "literal ' \" $(touch NEVER)\nλ🙂\n" :working_dir (os/cwd)
-   :command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+   :command [(runtime-path/lg-path)
              (str (os/cwd) "/test/fixtures/claude_worker.lg") scenario]
    :timeout_ms 3000})
 (defn attempt [options]
   (try (worker/run! options) (catch Exception e {:error (ex-data e) :message (str e)})))
-(deftest portable-fixture-runtime-selection
-  (doseq [[override expected] [[nil "lg"] ["" "lg"] ["  " "lg"] ["/custom/let-go/lg" "/custom/let-go/lg"]]]
-    (with-redefs [os/getenv (fn [key] (when (= key "LGX_LG") override))]
-      (is (= expected (first (:command (opts "success"))))))))
 (deftest native-prompt-and-protocol
   (let [events (atom []) options (assoc (opts "success") :on_event #(swap! events conj %)) result (attempt options)]
     (is (= (:prompt options) (:text result)))

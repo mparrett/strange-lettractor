@@ -1,0 +1,29 @@
+(ns harness.runtime
+  "Which let-go runtime test fixtures spawn. LGX_LG pins one explicitly;
+   otherwise it is the runtime already running the tests, so plain
+   `lgx test` needs no environment setup."
+  (:require [clojure.string :as str]
+            [os :as os]))
+
+(defn- shell-line [script]
+  (let [result (os/sh "/bin/sh" "-c" script)]
+    (when (= 0 (:exit result))
+      (let [line (str/trim (str (:out result)))]
+        (when-not (str/blank? line) line)))))
+
+(defn- running-runtime []
+  ;; The spawned shell's parent is this process; ps names its executable.
+  ;; A bare name means it was found on PATH, so resolve it the same way.
+  (when-let [command (shell-line "ps -o comm= -p $PPID")]
+    (if (str/starts-with? command "/")
+      command
+      (shell-line (str "command -v " command)))))
+
+(defn lg-path
+  "Absolute path of the runtime fixtures should spawn."
+  []
+  (let [pinned (os/getenv "LGX_LG")]
+    (or (when-not (str/blank? pinned) pinned)
+        (running-runtime)
+        (throw (ex-info "Cannot locate the let-go runtime: set LGX_LG"
+                        {:category :runtime-not-found})))))

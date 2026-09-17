@@ -1,11 +1,11 @@
 (ns attractor.http-fixture
-  (:require [attractor.context-discovery :as capacity] [attractor.execution :as execution]
+  (:require [harness.runtime :as runtime-path]
+            [attractor.context-discovery :as capacity] [attractor.execution :as execution]
             [http :as http] [os :as os] [clojure.string :as str] [clojure.core :as core]))
 
 (defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
 (defn run-fixture [f]
-  (let [runtime (os/getenv "LGX_LG")
-        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
+  (let [runtime (runtime-path/lg-path)
         port (+ 30000 (rand-int 20000)) token (str "capacity-" (rand-int 1000000000))
         base (str "http://127.0.0.1:" port)
         env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none

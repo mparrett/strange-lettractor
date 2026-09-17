@@ -5,7 +5,8 @@
    auth headers, request payload shape (roles, tools, provider-only fields) and
    normalized complete/stream results, and that no provider's fields leak into
    another's payload."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [harness.runtime :as runtime-path]
+            [clojure.test :refer [deftest is testing]]
             [clojure.core :as core]
             [clojure.string :as str]
             [http :as http]
@@ -17,8 +18,7 @@
 (defn- quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
 
 (defn with-wire-server [f]
-  (let [runtime (os/getenv "LGX_LG")
-        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
+  (let [runtime (runtime-path/lg-path)
         port (+ 30000 (rand-int 20000))
         token (str "wire-" (rand-int 1000000000))
         base (str "http://127.0.0.1:" port)
