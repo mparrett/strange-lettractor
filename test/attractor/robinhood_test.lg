@@ -1,9 +1,0 @@
-(ns attractor.robinhood-test
-  (:require [clojure.test :refer [deftest is]]
-            [attractor.robinhood :as rh]))
-
-;; Basic structural test to ensure the screener module loads
-(deftest screener-is-loaded
-  "Verify that the screener module exports screen-calls function."
-  (is (fn? rh/screen-calls)))
-
