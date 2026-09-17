@@ -25,7 +25,7 @@ TIMEOUT ?= 1500
 
 TEST_FILES := $(wildcard test/attractor/*_test.lg)
 
-.PHONY: help check-runtime install build test suite runners live-matrix live-smoke \
+.PHONY: help check-runtime install hooks build test suite runners live-matrix live-smoke \
         providers models clean distclean
 
 help: ## Show this help
@@ -40,6 +40,9 @@ check-runtime: ## Fail unless LGX_LG names an executable let-go runtime
 
 install: check-runtime ## Fetch pinned dependencies (tiny-tui) with lgx
 	$(LGX) install
+
+hooks: ## Gate pushes on the full suite (sets core.hooksPath to .githooks for this clone)
+	git config core.hooksPath .githooks
 
 build: check-runtime ## Build bin/attractor (removes the old binary first; macOS in-place rebuilds die with 137)
 	rm -f bin/attractor
