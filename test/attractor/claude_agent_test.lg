@@ -44,16 +44,20 @@
 (deftest cancellation-and-callback-failure-join-process
   (doseq [mode [:cancel :callback :timeout]]
     (let [dir (temp-dir) marker (str dir "/late") ready (promise) cancelled (atom false)
-          job (future (attempt (assoc (opts "late") :prompt marker :timeout_ms (if (= mode :timeout) 250 3000)
+          job (future (attempt (assoc (opts "late") :prompt marker :timeout_ms (if (= mode :timeout) 250 30000)
                     :cancelled? #(deref cancelled)
                     :on_event #(when (= :text_delta (:type %))
                                  (deliver ready true)
                                  (when (= mode :callback) (throw (ex-info "listener" {})))))))]
       (try
-        (is (true? (deref ready 2000 false)))
+        ;; These bounds catch a hang; they are not speed requirements, so
+        ;; they leave room for a slow process spawn on a loaded machine.
+        ;; The :timeout case may expire before the worker says anything.
+        (when-not (= mode :timeout)
+          (is (true? (deref ready 20000 false))))
         (when (= mode :cancel) (reset! cancelled true))
         (is (= (case mode :cancel :cancelled :callback :claude-callback :timeout :timeout)
-               (get-in (deref job 5000 {}) [:error :category])))
+               (get-in (deref job 20000 {}) [:error :category])))
         (is (realized? job))
         (core/sleep 1000)
         (is (nil? (os/stat marker)))
