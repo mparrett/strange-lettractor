@@ -1,0 +1,9 @@
+(ns solve
+  "The file under research. Keep `count-primes` correct; make it fast.")
+
+(defn prime? [n]
+  (and (>= n 2)
+       (not-any? #(zero? (rem n %)) (range 2 n))))
+
+(defn count-primes [limit]
+  (count (filter prime? (range limit))))

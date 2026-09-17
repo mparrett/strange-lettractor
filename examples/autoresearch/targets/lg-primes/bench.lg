@@ -1,0 +1,16 @@
+(ns main
+  "Fixed evaluation harness: do not edit. Prints `score: <median seconds>`."
+  (:require [os :as os] [solve :as solve]))
+
+(def limit 6000)
+(def expected 783)
+(def runs 3)
+
+(let [times (vec (for [_ (range runs)]
+                   (let [started (System/currentTimeMillis)
+                         answer (solve/count-primes limit)]
+                     (when-not (= expected answer)
+                       (println (str "wrong answer: " answer ", expected " expected))
+                       (os/exit 1))
+                     (- (System/currentTimeMillis) started))))]
+  (println (format "score: %.3f" (/ (nth (vec (sort times)) (quot runs 2)) 1000.0))))

@@ -1,0 +1,83 @@
+// The autoresearch loop (after github.com/karpathy/autoresearch) as a workflow:
+// propose one change, run the experiment under a fixed budget, keep it if the
+// metric improved, reset if not, repeat. The LLM only proposes edits; every
+// rule that must hold (which files may change, the time budget, keep/discard,
+// the results log) is a tool node. Language-neutral: the experiment is RUN_CMD.
+//
+// Run from the root of the TARGET git repository, with this kit copied to
+// ./autoresearch (see README.md):
+//   attractor run autoresearch/autoresearch.dot --logs-root attractor_runs
+//
+// To change the researcher's model, edit the stylesheet line below. Use the
+// fully qualified name `attractor models` prints (provider/model): a bare
+// "anthropic/..." selects the anthropic provider, not a gateway.
+// To change the per-experiment budget, edit timeout on `run` and `baseline_run`.
+digraph AutoResearch {
+    graph [
+        goal="Improve the metric in research.env by editing only the allowed files",
+        default_max_retry=0,
+        model_stylesheet="
+            .researcher { llm_model: \"openrouter/anthropic/claude-haiku-4.5\"; reasoning_effort: medium; }
+        "
+    ]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare, label="Stopped (limit reached or setup failed)"]
+
+    // --- setup and baseline: the first run is always the unmodified code ---
+    setup        [shape=parallelogram, timeout="1m",  tool_command="sh autoresearch/ar.sh setup"]
+    baseline_run [shape=parallelogram, timeout="10m", tool_command="sh autoresearch/ar.sh run"]
+    baseline_measure [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh measure"]
+    baseline_keep    [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh decide"]
+
+    // --- one experiment ---
+    begin   [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh begin"]
+
+    propose [shape=box, class="researcher", fidelity="truncate", timeout="20m",
+             prompt="You are an autonomous researcher. Read autoresearch/program.md and follow it exactly. Read research.env for the goal, the files you may edit (EDITABLE), and the metric. Read results.tsv to see every experiment so far and what was kept or discarded; do not repeat a discarded idea. Make ONE experimental change, editing only the EDITABLE files. Write a single-line description of the idea to .autoresearch/description. Do not run the experiment, do not use git, do not edit any other file: the workflow does those."]
+
+    guard   [shape=parallelogram, timeout="1m",  tool_command="sh autoresearch/ar.sh guard"]
+    run     [shape=parallelogram, timeout="10m", tool_command="sh autoresearch/ar.sh run"]
+    measure [shape=parallelogram, timeout="1m",  tool_command="sh autoresearch/ar.sh measure"]
+    decide  [shape=parallelogram, timeout="1m",  tool_command="sh autoresearch/ar.sh decide"]
+
+    // --- a crash or a blown budget: fix something dumb, or give the idea up ---
+    can_repair [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh can-repair"]
+    repair  [shape=box, class="researcher", fidelity="truncate", timeout="15m",
+             prompt="The experiment you proposed crashed, timed out, or printed no metric. Read .autoresearch/crash.log (the tail of run.log), .autoresearch/description, and autoresearch/program.md. If the cause is a simple mistake (typo, missing import, wrong name), fix it by editing only the EDITABLE files from research.env. If the idea itself is broken, change nothing. Do not run anything and do not use git."]
+    amend   [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh amend"]
+    give_up [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh give-up"]
+
+    // --- never stop, unless research.env sets MAX_ITERATIONS ---
+    again   [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh continue"]
+
+    start -> setup
+    setup -> baseline_run     [condition="outcome=success"]
+    setup -> exit             [condition="outcome=fail", label="Fix the setup problem and rerun"]
+    baseline_run -> baseline_measure [condition="outcome=success"]
+    baseline_run -> exit      [condition="outcome=fail", label="The unmodified code must run"]
+    baseline_measure -> baseline_keep [condition="outcome=success"]
+    baseline_measure -> exit  [condition="outcome=fail", label="METRIC_REGEX matched nothing"]
+    baseline_keep -> begin
+
+    begin -> propose
+    propose -> guard
+    guard -> run              [condition="outcome=success"]
+    guard -> again            [condition="outcome=fail", label="Nothing usable was proposed"]
+    run -> measure            [condition="outcome=success"]
+    run -> can_repair         [condition="outcome=fail", label="Crash or budget exceeded"]
+    measure -> decide         [condition="outcome=success"]
+    measure -> can_repair     [condition="outcome=fail", label="No metric printed"]
+    decide -> again
+
+    can_repair -> repair      [condition="outcome=success"]
+    can_repair -> give_up     [condition="outcome=fail", label="Out of repair attempts"]
+    repair -> amend
+    amend -> run              [condition="outcome=success"]
+    amend -> give_up          [condition="outcome=fail", label="No fix was made"]
+    give_up -> again
+
+    // A fresh run segment per iteration keeps context and logs from growing.
+    again -> begin            [condition="outcome=success", loop_restart=true]
+    again -> exit             [condition="outcome=fail"]
+}
