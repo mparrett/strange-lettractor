@@ -17,5 +17,5 @@
   run-pipeline {:doc "Run a DOT pipeline"
                 :args [{:name :file :type :string}]
                 :do  {:run ["main.lg" "run" :arg/file "--auto-approve"]}}
-  clean {:doc "Clean pipeline execution artifacts and logs"
+  clean-runs {:doc "Clean pipeline execution artifacts and logs"
          :do  {:run ["main.lg" "clean"]}}}}

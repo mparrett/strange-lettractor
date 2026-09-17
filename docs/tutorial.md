@@ -341,7 +341,7 @@ Clean all generated stage outputs, run logs, checkpoints, and temporary files:
 
 ```bash
 # Clean via lgx
-lgx clean
+lgx clean-runs
 
 # Clean via standalone binary
 ./bin/attractor clean
