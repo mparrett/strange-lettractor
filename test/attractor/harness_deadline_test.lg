@@ -1,0 +1,31 @@
+(ns attractor.harness-deadline-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [harness.deadline :as deadline]))
+
+(deftest deadline-fires-once-with-what-was-running
+  (let [fired (atom [])
+        watch (deadline/start! {:timeout-ms 30
+                                :describe (fn [] "slow-namespace")
+                                :on-timeout (fn [info] (swap! fired conj info))})]
+    (core/sleep 150)
+    (is (= [{:timeout-ms 30 :running "slow-namespace"}] @fired))
+    ((:cancel! watch))))
+
+(deftest cancelled-deadline-never-fires
+  (let [fired (atom [])
+        watch (deadline/start! {:timeout-ms 60
+                                :on-timeout (fn [info] (swap! fired conj info))})]
+    ((:cancel! watch))
+    (core/sleep 150)
+    (is (= [] @fired))))
+
+(deftest deadline-option-is-parsed-out-of-the-arguments
+  (is (= {:timeout-ms 5000 :args ["a.ns" "b.ns"]}
+         (deadline/split-args ["a.ns" "--deadline-ms" "5000" "b.ns"] 900000)))
+  (is (= {:timeout-ms 900000 :args ["run" "--live"]}
+         (deadline/split-args ["run" "--live"] 900000)))
+  ;; A deadline nobody can read is a bug, not "no deadline".
+  (is (= :invalid-deadline
+         (:category (ex-data (try (deadline/split-args ["--deadline-ms" "soon"] 1)
+                                  (catch Object e e)))))))

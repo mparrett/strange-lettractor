@@ -6,7 +6,8 @@
    the observable outcome (files on disk, tool results, events), never on the
    model's wording. Records go to evidence/parity-matrix-evidence/<model>-<time>.edn. Exit 0 when
    every row passed, 1 otherwise, 3 when no model is configured."
-  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io]
+  (:require [harness.deadline :as deadline]
+            [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io]
             [attractor.agent :as agent] [attractor.execution :as execution]
             [attractor.llm :as llm] [attractor.providers :as providers]
             [attractor.profiles :as profiles]
@@ -128,7 +129,8 @@
                            :edited_file (when (= row :provider-edit-format) (file dir "edit-target.txt"))})
        :error (:error outcome)})))
 
-(defn -main [& _]
+(defn -main [& args]
+  (deadline/arm-from-args! args 1800000 "the parity matrix")
   (let [spec (env "ATTRACTOR_LIVE_MODEL")]
     (if (nil? spec)
       (do (prn {:status :skipped :reason "ATTRACTOR_LIVE_MODEL not set (provider/name)"}) (os/exit 3))

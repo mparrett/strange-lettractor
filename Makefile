@@ -21,6 +21,9 @@ LGX := lgx
 TINY_TUI := $(firstword $(wildcard $(HOME)/.lgx/gitlibs/github.com/abogoyavlensky/tiny-tui/*/src))
 SOURCE_PATHS := src:test$(if $(TINY_TUI),:$(TINY_TUI))
 RUNNER := test/runner.lg
+# Seconds the full suite may run; the harness enforces it (exit 124) and
+# names the test that was running. Live scripts carry their own defaults
+# and accept --deadline-ms.
 TIMEOUT ?= 1500
 
 TEST_FILES := $(wildcard test/attractor/*_test.lg)
@@ -48,36 +51,36 @@ build: check-runtime ## Build bin/attractor (removes the old binary first; macOS
 	rm -f bin/attractor
 	$(LGX) build
 
-test: check-runtime ## Full suite through lgx (about two minutes)
-	perl -e 'alarm $(TIMEOUT); exec @ARGV' $(LGX) test
+test: check-runtime ## Full suite through the project harness, which owns its deadline (about four minutes)
+	"$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) --all --deadline-ms $$(( $(TIMEOUT) * 1000 ))
 
 suite: test ## Alias for test
 
 runners: check-runtime ## Every test namespace in its own process, one summary line each
 	@fail=0; for f in $(TEST_FILES); do \
 	  ns=attractor.$$(basename "$$f" .lg | tr _ -); printf '%-52s ' "$$ns"; \
-	  out=$$(perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) "$$ns" 2>&1 \
+	  out=$$("$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) "$$ns" 2>&1 \
 	        | grep -E -m1 '^\{:error'); \
 	  echo "$${out:-no summary line (load or runtime error)}"; \
 	  case "$$out" in *":error 0,"*":fail 0}"*) ;; *) fail=1;; esac; \
 	done; exit $$fail
 
 run-%: check-runtime ## One test namespace, e.g. make run-providers (attractor.providers-test)
-	perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) attractor.$(subst _,-,$*)-test
+	"$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) attractor.$(subst _,-,$*)-test
 
 live-matrix: check-runtime ## Credential-gated provider matrix (registry keys; ATTRACTOR_MATRIX_PROVIDERS=a,b to restrict)
-	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/provider_matrix.lg run
+	"$(LG)" -source-paths src:test test/live/provider_matrix.lg run
 
 live-parity: check-runtime ## Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL (provider/name)
-	perl -e 'alarm 1800; exec @ARGV' "$(LG)" -source-paths src:test test/live/parity_matrix.lg run
+	"$(LG)" -source-paths src:test test/live/parity_matrix.lg run
 
 live-smoke: check-runtime ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
-	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
+	"$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
 
 live-mcp-pilot: check-runtime ## MCP pilot dry run (no network): prints plan, exits 2
-	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --dry-run
+	"$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --dry-run
 live-mcp-pilot-live: check-runtime ## LIVE MCP pilot: OAuth + read-only calls (operator browser step; no token pasting)
-	perl -e 'alarm 1200; exec @ARGV' "$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --live
+	"$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --live
 
 providers: build ## Show the effective provider registry
 	bin/attractor providers

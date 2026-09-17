@@ -5,7 +5,8 @@
    the run exits 3 and prints a skip record; a skip is never a pass.
    Stage artifacts and result.edn persist under evidence/runtime-smoke-evidence;
    only the model's temporary working directory is removed."
-  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+  (:require [harness.deadline :as deadline]
+            [clojure.test :refer [deftest is]] [clojure.string :as str]
             [os :as os] [io :as io] [json :as json]
             [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer] [attractor.agent :as agent]
@@ -62,7 +63,8 @@
                     (count @events) " events, logs " logs-root))
       (finally (os/sh "/bin/rm" "-rf" "--" root)))))
 
-(defn -main [& _]
+(defn -main [& args]
+  (deadline/arm-from-args! args 900000 "the pipeline smoke")
   (if (str/blank? model)
     (do (prn {:scenario "SCN-ATTR-SMOKE-LIVE" :status :skipped :reason "ATTRACTOR_LIVE_MODEL not set"})
         (os/exit 3))

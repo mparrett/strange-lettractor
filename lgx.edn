@@ -10,7 +10,7 @@
 
  :tasks
  {suite {:doc "Run Attractor test suite"
-         :do  {:run "test/runner.lg"}}
+         :do  {:run ["test/runner.lg" "--all"]}}
   validate {:doc "Validate a DOT pipeline"
             :args [{:name :file :type :string}]
             :do  {:run ["main.lg" "validate" :arg/file]}}

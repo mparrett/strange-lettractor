@@ -1,21 +1,86 @@
 (ns main
-  "Run one or more test namespaces in isolation:
+  "The project's test harness. Runs test namespaces in one process, each
+   test var under its fixtures, with the harness's own deadline:
      lg -source-paths src:test test/runner.lg attractor.providers-test [more...]
-   Prints the counters map, then the full report only when something failed,
-   and exits 1 on failure. The full suite is `lgx test`."
-  (:require [os :as os]))
+     lg -source-paths src:test test/runner.lg --all [--deadline-ms N] [--verbose]
+   Output: one line per failing test with its detail, then a summary
+   (--verbose lists passing tests too). Exits 0 on success, 1 on failure,
+   and 124 when the deadline passes, naming the test that was running, so
+   callers need no external timeout wrapper."
+  (:require [test :refer [*registered-tests* *report-counters*
+                          *test-result* *each-fixtures*]]
+            [clojure.string :as str]
+            [os :as os]
+            [harness.deadline :as deadline]))
 
-(defn -main [& names]
-  (when (empty? names)
-    (println "usage: test/runner.lg <namespace> [namespace...]   e.g. attractor.providers-test")
-    (os/exit 2))
-  ;; Probes required by a test run their own -main when *command-line-args*
-  ;; is non-empty; the runner's arguments are not theirs.
-  (binding [*command-line-args* nil]
-    (doseq [n names] (require (symbol n))))
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+(def default-deadline-ms 600000)
+(def suite-deadline-ms 1500000)
+
+(defn- all-test-namespaces []
+  (->> (str/split (str (:out (os/sh "ls" "test/attractor"))) #"\n")
+       (filter #(str/ends-with? % "_test.lg"))
+       sort
+       (mapv #(str "attractor." (str/replace (subs % 0 (- (count %) 3)) "_" "-")))))
+
+(defn- compose-fixtures [f g] (fn [t] (f (fn [] (g t)))))
+(defn- join-fixtures [fixtures]
+  (reduce compose-fixtures (fn [t] (t)) fixtures))
+
+(defn- var-name [test-var]
+  (last (str/split (str test-var) #"/")))
+
+(defn- detail-lines [output]
+  (remove #(or (str/blank? %) (str/starts-with? % "PASS ") (str/starts-with? % "Testing: "))
+          (str/split (str output) #"\n")))
+
+(defn- run-test-var! [test-var]
+  (set! *report-counters* (update *report-counters* :test inc))
+  (let [before *report-counters*
+        result (try
+                 {:out (with-out-str
+                         ((join-fixtures *each-fixtures*) (fn [] ((deref test-var)))))}
+                 (catch Object error
+                   (set! *report-counters* (update *report-counters* :error inc))
+                   (set! *test-result* false)
+                   {:out "" :error error}))
+        after *report-counters*]
+    (assoc result :failed? (or (> (:fail after) (:fail before))
+                               (> (:error after) (:error before))))))
+
+(defn -main [& raw-args]
+  (let [flags #{"--all" "--verbose"}
+        all? (boolean (some #(= "--all" %) raw-args))
+        verbose? (boolean (some #(= "--verbose" %) raw-args))
+        {:keys [timeout-ms args]} (deadline/split-args
+                                    (remove flags raw-args)
+                                    (if all? suite-deadline-ms default-deadline-ms))
+        names (if all? (all-test-namespaces) args)]
+    (when (empty? names)
+      (println "usage: test/runner.lg <namespace> [namespace...] | --all   [--deadline-ms N] [--verbose]")
+      (os/exit 2))
+    (let [running (atom "startup")
+          watch (deadline/start! {:timeout-ms timeout-ms :describe (fn [] @running)})]
+      ;; Probes required by a test run their own -main when *command-line-args*
+      ;; is non-empty; the runner's arguments are not theirs.
+      (binding [*command-line-args* nil]
+        (doseq [n names]
+          (reset! running (str "load of " n))
+          (require (symbol n))))
+      (doseq [n names
+              test-var (get *registered-tests* (the-ns (symbol n)) [])]
+        (reset! running (str n "/" (var-name test-var)))
+        (let [{:keys [failed? out error]} (run-test-var! test-var)]
+          (cond
+            failed? (do (println (str "✗ " n "/" (var-name test-var)))
+                        (doseq [line (detail-lines out)] (println (str "    " line)))
+                        (when error (println (str "    ERROR: " error))))
+            verbose? (println (str "✓ " n "/" (var-name test-var))))))
+      ((:cancel! watch))
+      (let [counters *report-counters*
+            failures (+ (:fail counters) (:error counters))]
+        (prn counters)
+        (println (str (:test counters) " tests, " (+ (:pass counters) (:fail counters))
+                      " assertions, " failures " failures"))
+        (os/exit (if (zero? failures) 0 1))))))
 
 (when *command-line-args* (apply -main *command-line-args*))

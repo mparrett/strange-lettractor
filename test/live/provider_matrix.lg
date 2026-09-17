@@ -13,7 +13,8 @@
    3 when nothing was configured. Evidence is written to
    evidence/provider-matrix-evidence.edn with secrets redacted (provider, model,
    journey, status, duration, error category)."
-  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json] [http :as http]
+  (:require [harness.deadline :as deadline]
+            [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json] [http :as http]
             [attractor.llm :as llm] [attractor.agent :as agent] [attractor.profiles :as profiles]
             [attractor.providers :as providers] [attractor.execution :as execution]
             [live.provider-matrix-checks :as checks] [attractor.ids :as ids]))
@@ -229,7 +230,8 @@
     (merge {:provider (:provider target) :model (:model target) :journey name
             :duration_ms (- (System/currentTimeMillis) started)} result)))
 
-(defn -main [& _]
+(defn -main [& args]
+  (deadline/arm-from-args! args 900000 "the provider matrix")
   (let [targets (configured)]
     (if (empty? targets)
       (do (prn {:scenario "SCN-PROVIDER-MATRIX" :status :skipped :reason "no provider credentials in the environment"})

@@ -1,0 +1,58 @@
+(ns harness.deadline
+  "Whole-run deadline owned by the test harness itself. A watchdog future
+   ends a run that outlives its budget and says what was running, so no
+   caller has to wrap the process in an external alarm. It fires even
+   while the main thread is busy; exit code 124 matches timeout(1)."
+  (:require [clojure.core :as core]
+            [clojure.string :as str]
+            [os :as os]))
+
+(def flag "--deadline-ms")
+(def poll-ms 25)
+
+(defn split-args
+  "Pull `--deadline-ms N` out of args. Returns {:timeout-ms :args}."
+  [args default-ms]
+  (loop [remaining (seq args) kept [] timeout-ms default-ms]
+    (cond
+      (nil? remaining) {:timeout-ms timeout-ms :args kept}
+      (= flag (first remaining))
+      (let [parsed (try (parse-long (str (second remaining))) (catch Object _ nil))]
+        (when-not (and parsed (pos? parsed))
+          (throw (ex-info (str flag " needs a positive number of milliseconds")
+                          {:category :invalid-deadline :value (second remaining)})))
+        (recur (nnext remaining) kept parsed))
+      :else (recur (next remaining) (conj kept (first remaining)) timeout-ms))))
+
+(defn- exit-on-timeout [{:keys [timeout-ms running]}]
+  (println)
+  (println (str "DEADLINE: run exceeded " timeout-ms "ms"
+                (when-not (str/blank? (str running)) (str " while running " running))))
+  (os/exit 124))
+
+(defn start!
+  "Arm the deadline. opts: :timeout-ms, :describe (fn [] what is running
+   now), :on-timeout (fn [info], default prints and exits 124). Returns
+   {:cancel! (fn [])}; cancel when the run finishes on its own."
+  [{:keys [timeout-ms describe on-timeout]}]
+  (let [cancelled (atom false)
+        deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (core/future
+      (loop []
+        (cond
+          @cancelled nil
+          (>= (System/currentTimeMillis) deadline)
+          ((or on-timeout exit-on-timeout)
+           {:timeout-ms timeout-ms
+            :running (when describe (try (describe) (catch Object _ nil)))})
+          :else (do (core/sleep poll-ms) (recur)))))
+    {:cancel! (fn [] (reset! cancelled true) nil)}))
+
+(defn arm-from-args!
+  "Entry-point convenience for scripts: honour `--deadline-ms N` (else
+   default-ms), arm the deadline labelled with what the script is, and
+   return the remaining args. Scripts end with os/exit, so nothing cancels."
+  [args default-ms label]
+  (let [{:keys [timeout-ms args]} (split-args args default-ms)]
+    (start! {:timeout-ms timeout-ms :describe (fn [] label)})
+    (vec args)))

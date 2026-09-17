@@ -21,7 +21,8 @@
    With --tool, the pilot additionally calls the explicitly named tool.
    Name a read-only tool only. Evidence lands in
    evidence/mcp-pilot-trading-evidence.edn (or ATTRACTOR_PILOT_EVIDENCE)."
-  (:require [clojure.string :as str]
+  (:require [harness.deadline :as deadline]
+            [clojure.string :as str]
             [clojure.core :as core]
             [os :as os] [io :as io] [json :as json] [http :as http]
             [attractor.mcp-client :as mcp-client]
@@ -138,7 +139,7 @@
                  :pass :fail)
        :expires-in (:expires-in fresh)}))))
 
-(defn -main [& args]
+(defn- run-pilot [args]
   (when-not (flag? args "--live")
     (dry-run-plan args))
   (let [timeout-ms (or (try (parse-long (find-arg-val args "--timeout-ms"))
@@ -184,5 +185,8 @@
               :skipped (count (filter #(= :skipped (:status %)) rows))
               :failed (count failed)})
         (os/exit (if (seq failed) 1 0))))))
+
+(defn -main [& raw-args]
+  (run-pilot (deadline/arm-from-args! raw-args 1200000 "the MCP OAuth pilot")))
 
 (when *command-line-args* (apply -main *command-line-args*))
