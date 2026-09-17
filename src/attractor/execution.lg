@@ -373,8 +373,16 @@
     ") >/dev/null 2>&1 &\n"
     "watchdog=$!\n"
     "disown \"$watchdog\" 2>/dev/null\n"
+    ;; The poller also watches the wrapper itself ($$ is still the wrapper
+    ;; inside a subshell). A wrapper killed from outside cannot clean up, and
+    ;; an orphaned poller would spin on the marker forever, so it takes the
+    ;; watchdog and the command group down with it.
     "(\n"
-    "  while [ ! -e \"$cancel_marker\" ]; do sleep 0.05; done\n"
+    "  while [ ! -e \"$cancel_marker\" ] && kill -0 $$ 2>/dev/null; do sleep 0.05; done\n"
+    "  if [ ! -e \"$cancel_marker\" ]; then\n"
+    "    pkill -KILL -P \"$watchdog\" 2>/dev/null\n"
+    "    kill -KILL \"$watchdog\" 2>/dev/null\n"
+    "  fi\n"
     "  kill -TERM -\"$child\" 2>/dev/null || exit 0\n"
     "  sleep 2\n"
     "  kill -KILL -\"$child\" 2>/dev/null || true\n"

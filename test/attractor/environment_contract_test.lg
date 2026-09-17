@@ -7,6 +7,7 @@
             [clojure.core :as core]
             [io :as io]
             [os :as os]
+            [harness.deadline :as deadline]
             [attractor.execution :as execution]))
 
 (def exec-result-keys #{:stdout :stderr :exit_code :timed_out :duration_ms :cancelled})
@@ -263,3 +264,28 @@
     (is (= "ran:x" (:stdout (exec environment "x" 10))))))
 
 ;; SCN-CAL-ENV COMPLETE
+
+(defn- pids-mentioning [needle]
+  ;; pgrep is run directly (no shell) so nothing but the processes under
+  ;; test carries the needle in its arguments.
+  (->> (str/split (str (:out (os/sh "pgrep" "-f" needle))) #"\s+")
+       (remove str/blank?)
+       vec))
+
+(deftest a-killed-wrapper-leaves-no-helper-processes-behind
+  ;; The wrapper's helpers (timeout watchdog, cancel-marker poller) must not
+  ;; outlive it: a poller orphaned by a killed wrapper spins forever.
+  (let [root (fresh-root "orphans")
+        needle "37.4242"
+        environment (execution/make-local-environment {:working_dir root})
+        job (core/future (exec environment (str "sleep " needle) 60000))]
+    (try
+      (is (true? (deadline/wait-until #(seq (pids-mentioning needle)) 5000)))
+      (let [wrapper (str/trim (str (:out (os/sh "pgrep" "-o" "-f" needle))))]
+        (os/sh "kill" "-KILL" wrapper)
+        (is (true? (deadline/wait-until #(empty? (pids-mentioning needle)) 8000))
+            (str "still running: " (pr-str (pids-mentioning needle)))))
+      (finally
+        (doseq [pid (pids-mentioning needle)] (os/sh "kill" "-KILL" pid))
+        (deref job 5000 nil)
+        ((:cleanup environment))))))
