@@ -236,10 +236,14 @@
   [transport resource-url & [opts]]
   (when-not (str/starts-with? (str resource-url) "https://")
     (fail! :auth-endpoint-not-https {:reason :resource-url-must-be-https}))
-  (let [response (bounded-call
+  (let [parts (str/split (str/replace (str resource-url) #"^https://" "") #"/")
+        host (first parts)
+        path (str/join "/" (rest parts))
+        well-known (str "https://" host "/.well-known/oauth-protected-resource/" path)
+        response (bounded-call
                    transport
                    {:method :get
-                    :url (str resource-url "/.well-known/oauth-protected-resource/")
+                    :url well-known
                     :headers {"accept" "application/json"}}
                    (:timeout-ms opts))
         body (try (json/read-json (str (:body response)))
