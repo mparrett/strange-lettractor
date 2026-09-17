@@ -7,9 +7,9 @@
    - Liquidity: 10% spread, 100+ open interest, non-zero bid
 
    Scores by:
-   - Implied volatility vs realized (vol gap)
-   - Volatility smile outliers (strikes far from ATM pay premium)
-   - Term structure cheapness (current call cheaper than same delta call at longer DTE)
+   - Implied volatility
+   - Liquidity metrics (spread + open interest)
+   - Strike distance from underlying price
 
    Outputs ranked table of call opportunities."
   (:require [clojure.string :as str]
@@ -21,22 +21,8 @@
 (def min-expiry-days 90)
 (def max-expiry-days 400)
 (def max-budget-cents 50000)  ; $500.00 in cents
-(def min-bid-cents 1)         ; non-zero bid requirement
 (def max-spread-pct 10.0)     ; 10% spread
 (def min-open-interest 100)
-
-;; ============================================================================
-;; Date and Time Utilities
-;; ============================================================================
-
-(defn- days-to-expiry [expiry-date]
-  "Calculate days between now and expiry date.
-   expiry-date: ISO 8601 date string (YYYY-MM-DD)"
-  (let [today (.format (java.time.LocalDate/now) (java.time.format.DateTimeFormatter/ISO_LOCAL_DATE))
-        today-date (java.time.LocalDate/parse today (java.time.format.DateTimeFormatter/ISO_LOCAL_DATE))
-        expiry (java.time.LocalDate/parse expiry-date (java.time.format.DateTimeFormatter/ISO_LOCAL_DATE))
-        days (java.time.temporal.ChronoUnit/DAYS (.until today-date expiry))]
-    days))
 
 ;; ============================================================================
 ;; Filtering Functions
@@ -44,8 +30,7 @@
 
 (defn- passes-expiry-filter? [option]
   "Check if option meets expiry range requirements (90-400 days)"
-  (let [expiry-date (get option "expiration_date")
-        dte (when expiry-date (days-to-expiry expiry-date))]
+  (let [dte (get option "days_to_expiration")]
     (and dte (>= dte min-expiry-days) (<= dte max-expiry-days))))
 
 (defn- passes-budget-filter? [option]
@@ -62,10 +47,10 @@
         mid (/ (+ bid ask) 2.0)
         spread-pct (when (pos? mid) (* 100.0 (/ (- ask bid) mid)))]
     (and
-      bid (> bid 0)                          ; non-zero bid
-      ask (> ask 0)                          ; non-zero ask
-      oi (>= oi min-open-interest)           ; 100+ open interest
-      spread-pct (<= spread-pct max-spread-pct))))  ; 10% spread
+      bid (> bid 0)
+      ask (> ask 0)
+      oi (>= oi min-open-interest)
+      spread-pct (<= spread-pct max-spread-pct))))
 
 (defn- passes-all-filters? [option]
   "Check if option passes all hard filters"
@@ -77,12 +62,6 @@
 ;; Scoring Functions
 ;; ============================================================================
 
-(defn- bid-ask-midpoint [option]
-  "Calculate midpoint between bid and ask"
-  (let [bid (get option "bid_price")
-        ask (get option "ask_price")]
-    (when (and bid ask) (/ (+ bid ask) 2.0))))
-
 (defn- spread-pct [option]
   "Calculate bid-ask spread as percentage of midpoint"
   (let [bid (get option "bid_price")
@@ -90,36 +69,31 @@
     (when (and bid ask (pos? (+ bid ask)))
       (* 100.0 (/ (- ask bid) (+ bid ask))))))
 
+(defn- abs-val [x]
+  "Absolute value"
+  (if (neg? x) (- x) x))
+
 (defn- implied-vol-score [option]
-  "Score based on implied volatility.
-   Lower IV (relative to peers) = better value. Return 0-1 where higher is better."
+  "Score based on implied volatility (lower = better). 0-1 scale"
   (let [iv (get option "implied_volatility")]
     (when iv
-      ;; Convert IV to 0-1 score: lower IV = higher score
-      ;; Assume IV ranges from 0% to 200%
       (min 1.0 (max 0.0 (/ (- 2.0 iv) 2.0))))))
 
 (defn- liquidity-score [option]
-  "Score based on liquidity metrics.
-   Lower spread + higher OI = better value. Return 0-1 where higher is better."
+  "Score based on liquidity: spread and OI. 0-1 scale"
   (let [spread (spread-pct option)
         oi (get option "open_interest")]
     (when (and spread oi)
-      ;; Spread score: 10% spread = 0.0, 0% = 1.0
       (let [spread-score (max 0.0 (- 1.0 (/ spread 10.0)))
-            ;; OI score: 100 OI = 0.0, 10000+ = 1.0
-            oi-score (min 1.0 (/ (Math/log (+ oi 1)) (Math/log 10000)))]
+            oi-score (min 1.0 (/ (- oi 100.0) 900.0))]
         (/ (+ spread-score oi-score) 2.0)))))
 
 (defn- strike-distance-score [option underlying-price]
-  "Score based on strike distance from ATM.
-   ATM or slightly OTM = better value than deep OTM. Return 0-1 where higher is better."
+  "Score based on strike distance from ATM. 0-1 scale"
   (let [strike (get option "strike_price")
         distance-pct (when (and strike underlying-price (pos? underlying-price))
-                       (Math/abs (/ (- strike underlying-price) underlying-price)))]
+                       (/ (abs-val (- strike underlying-price)) underlying-price))]
     (when distance-pct
-      ;; At-the-money or slightly OTM (0-5%) = 1.0
-      ;; Deep OTM (>30%) = 0.2
       (cond
         (<= distance-pct 0.05) 1.0
         (<= distance-pct 0.10) 0.9
@@ -128,8 +102,7 @@
         :else 0.2))))
 
 (defn- calculate-overall-score [option underlying-price]
-  "Calculate composite score for option quality/value.
-   Returns 0-100 score."
+  "Calculate composite score for option (0-100)"
   (let [iv-score (implied-vol-score option)
         liq-score (liquidity-score option)
         dist-score (strike-distance-score option underlying-price)]
@@ -141,13 +114,12 @@
 ;; ============================================================================
 
 (defn- format-result [option underlying-price]
-  "Format option for output display"
+  "Format option for display"
   (let [strike (get option "strike_price")
         expiry (get option "expiration_date")
-        dte (days-to-expiry expiry)
+        dte (get option "days_to_expiration")
         bid (get option "bid_price")
         ask (get option "ask_price")
-        mid (bid-ask-midpoint option)
         iv (get option "implied_volatility")
         delta (get option "delta")
         oi (get option "open_interest")
@@ -159,70 +131,52 @@
      :strike strike
      :expiry expiry
      :dte dte
-     :bid (format "%.2f" bid)
-     :ask (format "%.2f" ask)
-     :mid (format "%.2f" mid)
-     :spread-pct (format "%.1f%%" spread)
-     :iv (format "%.1f%%" (* 100.0 iv))
-     :delta (format "%.3f" delta)
+     :bid bid
+     :ask ask
+     :spread-pct spread
+     :iv iv
+     :delta delta
      :oi oi
      :cost-cents cost-cents
-     :break-even (format "%.2f" break-even)
-     :score (format "%.1f" score)}))
+     :break-even break-even
+     :score score}))
 
 (defn- print-results-table [results]
   "Print results as formatted table"
   (when (empty? results)
-    (do
-      (println "No suitable call options found matching criteria.")
-      (println "\nFilters Applied:")
-      (println (str "  - Expiry: " min-expiry-days "-" max-expiry-days " days to expiration"))
-      (println (str "  - Budget: max $" (/ max-budget-cents 100.0) " per contract at ask"))
-      (println (str "  - Liquidity: bid-ask spread <= " max-spread-pct "%, OI >= " min-open-interest))
-      nil))
-
-  (println "\n=== Robinhood Options Call Screener ===\n")
-  (println (str "Found " (count results) " call options matching filters\n"))
-
-  ;; Header
-  (printf "%-8s %-8s %-12s %-5s %-8s %-8s %-10s %-10s %-8s %-8s %-6s %-7s %-8s\n"
-          "Strike" "Expiry" "DTE" "Bid" "Ask" "Spread" "IV" "Delta" "OI" "Cost" "B/E" "Score")
-  (println (str/join (repeat 110 "-")))
-
-  ;; Rows
-  (doseq [r results]
-    (printf "%-8.2f %-12s %-5d %-8s %-8s %-10s %-10s %-8s %-8s %-6d %-7.2f %-8s\n"
-            (r :strike)
-            (r :expiry)
-            (r :dte)
-            (r :bid)
-            (r :ask)
-            (r :spread-pct)
-            (r :iv)
-            (r :delta)
-            (r :oi)
-            (r :cost-cents)
-            (r :break-even)
-            (r :score)))
-
-  (println "\nFilters Applied:")
-  (println (str "  - Expiry: " min-expiry-days "-" max-expiry-days " days to expiration"))
-  (println (str "  - Budget: max $" (/ max-budget-cents 100.0) " per contract at ask"))
-  (println (str "  - Liquidity: bid-ask spread <= " max-spread-pct "%, OI >= " min-open-interest))
-  (println "\nScoring: Equal weight on IV, liquidity (spread + OI), and strike distance from ATM"))
+    (println "No suitable call options found matching criteria.\n"))
+  (when (seq results)
+    (println "\n=== Robinhood Options Call Screener ===")
+    (println (str "Found " (count results) " options matching criteria\n"))
+    (println "Strike  Expiry       DTE   Bid    Ask    Spread  IV      Delta    OI    Score")
+    (println (str/join (repeat 75 "-")))
+    (doseq [r (take 20 results)]
+      (println (str
+                (r :strike) "      "
+                (r :expiry) "  "
+                (r :dte) "    "
+                (r :bid) "  "
+                (r :ask) "  "
+                (r :spread-pct) "  "
+                (* 100.0 (r :iv)) "  "
+                (r :delta) "  "
+                (r :oi) "    "
+                (r :score))))
+    (println "\nTop 20 shown. Filters: DTE " min-expiry-days "-" max-expiry-days
+             " days, Ask <= $" (/ max-budget-cents 100.0) ", Spread <= " max-spread-pct "%")))
 
 ;; ============================================================================
 ;; Main Screener
 ;; ============================================================================
 
 (defn screen-calls
-  "Screen for underpriced call options on given symbol.
+  "Screen for underpriced call options.
 
    Args:
    - symbol: stock symbol (e.g., \"QQQ\", \"SPXW\")
    - mcp-handle: open MCP session handle
 
-   Returns: list of formatted results, sorted by score descending"
+   Returns: list of results, sorted by score descending"
   [symbol mcp-handle]
 
   (let [;; Get current underlying price
@@ -262,7 +216,7 @@
         formatted (map #(format-result % underlying-price) filtered)
 
         ;; Sort by score descending
-        sorted (sort-by #(- (read-string (str/replace (% :score) #"[^0-9.]" ""))) formatted)]
+        sorted (sort-by #(- (% :score)) formatted)]
 
     (print-results-table sorted)
     sorted))
