@@ -351,6 +351,20 @@
       {:provider (or explicit-provider (detect-provider s))
        :model s})))
 
+;; A request that already names its provider has been routed: the client
+;; resolved any `provider/` prefix before middleware ran. What is left in
+;; :model is the provider's own model name, and gateways name models
+;; `vendor/model`, so it must not be parsed for a provider a second time.
+;; Only a prefix repeating that same provider is still stripped. Requests
+;; without a provider keep the user-facing rule: a prefix selects the provider.
+(defn request-target [request opts]
+  (let [explicit (when-not (str/blank? (str (:provider request)))
+                   (str/lower-case (str/trim (str (:provider request)))))
+        parsed (parse-model-spec (:model request) (or explicit (:provider opts)))]
+    (if (and explicit (not= explicit (:provider parsed)))
+      {:provider explicit :model (str (:model request))}
+      parsed)))
+
 ;; Unified request construction
 (defn make-request [model messages & [opts]]
   (let [parsed (parse-model-spec model (:provider opts))
@@ -1826,7 +1840,7 @@
 ;; Unified Client Complete
 (defn complete [request & [client-opts]]
   (let [opts (merge request client-opts)
-        parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
+        parsed (request-target request opts)
         provider (:provider parsed)
         actual-model (:model parsed)
         req (assoc request :provider provider :model actual-model)]
@@ -2588,7 +2602,7 @@
 
 (defn- provider-stream [request & [client-opts]]
   (let [opts (merge request client-opts)
-        parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
+        parsed (request-target request opts)
         provider (:provider parsed)
         req (assoc request :provider provider :model (:model parsed))]
     (case (providers/protocol-of provider)

@@ -171,6 +171,20 @@
     (is (= {:provider "openai-compat" :model "custom-llama"}
            (llm/parse-model-spec "custom-llama" "openai-compat")))))
 
+(deftest routed-requests-are-not-parsed-for-a-provider-twice
+  ;; The client routes `openrouter/anthropic/claude-haiku-4.5` to provider
+  ;; openrouter, model `anthropic/claude-haiku-4.5`. Parsing that again sent
+  ;; the call to the anthropic provider.
+  (is (= {:provider "openrouter" :model "anthropic/claude-haiku-4.5"}
+         (llm/request-target {:provider "openrouter" :model "anthropic/claude-haiku-4.5"} {})))
+  (is (= {:provider "openrouter" :model "anthropic/claude-haiku-4.5"}
+         (llm/request-target {:provider "openrouter" :model "openrouter/anthropic/claude-haiku-4.5"} {})))
+  ;; Without a routed provider, the user-facing rule stands: the prefix wins.
+  (is (= {:provider "anthropic" :model "claude-3-7-sonnet"}
+         (llm/request-target {:model "anthropic/claude-3-7-sonnet"} {:provider "openai"})))
+  (is (= {:provider "openai-compat" :model "custom-llama"}
+         (llm/request-target {:model "custom-llama"} {:provider "openai-compat"}))))
+
 (deftest test-request-omits-unspecified-generation-settings
   (let [request (llm/make-request "openai/gpt-test"
                                   [{:role :user :content "hello"}])]
