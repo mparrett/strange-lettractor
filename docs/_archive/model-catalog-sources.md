@@ -1,5 +1,9 @@
 # Model catalog sources
 
+> Archived 2026-09-17. Each cutoff's source now lives beside it in
+> `src/attractor/models.lg` (`:knowledge_cutoff_source`), which is what the
+> tests check. This note is kept as the dated verification history.
+
 `src/attractor/models.lg` records a `:knowledge_cutoff` only where the vendor
 publishes one. Values are the vendor's *reliable* cutoff where two dates are
 given. Anything not listed here is reported as `unknown` in the system

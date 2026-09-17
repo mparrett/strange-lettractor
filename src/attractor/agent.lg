@@ -218,6 +218,7 @@
                  (environment-command environment "git log -5 --pretty=%s"))
         {:keys [model_display_name knowledge_cutoff]} (resolve-model-metadata profile)]
     {:working_directory working-dir
+     :git_root git-root
      :is_git_repository (boolean git-root)
      :git_branch (or branch "")
      :git_status_count (if (str/blank? status)
@@ -340,7 +341,7 @@
           snapshot (environment-snapshot environment profile)
           selected-skills (vec (or (:skills options) []))
           skill-access (skills/env-file-access environment)
-          repo-git-root (environment-command environment "git rev-parse --show-toplevel")
+          repo-git-root (:git_root snapshot)
           repo-working-dir ((:working_directory environment))
           skill-roots {:project-root (or (:project_skills_root options)
                                          (skills/project-skills-root

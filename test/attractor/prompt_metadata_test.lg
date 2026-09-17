@@ -22,47 +22,66 @@
                                   {:message {:role :assistant :content "done"} :tool_calls []})})]
     (try
       (let [first-result (agent/process-input! session "first")
+            first-turn-commands @calls
             _ (reset! changed true)
             second-result (agent/process-input! session "second")]
         {:results [first-result second-result] :requests @requests :commands @calls
+         :first-turn-commands first-turn-commands
          :snapshot (:environment_snapshot @session)
          :prompts (mapv #(get-in % [:messages 0 :content]) @requests)})
       (finally (agent/close-session! session)))))
 
+(def fixture-catalog
+  "Synthetic catalog facts: these tests exercise snapshotting and
+   precedence, not what any vendor currently publishes."
+  [{:id "fixture-model" :provider "openai" :display_name "Fixture Model"
+    :knowledge_cutoff "2024-03" :aliases ["fx"]}
+   {:id "fixture-no-cutoff" :provider "gemini" :display_name "Fixture No Cutoff"
+    :aliases []}])
+
 (deftest actual-request-environment-is-snapshotted-and-complete
-  (let [{:keys [results prompts commands requests snapshot]} (capture (profiles/create-openai-profile "gpt-5.2-codex"))
-        block (second (re-find #"(?s)<environment>\n(.*?)</environment>" (first prompts)))]
-    (is (= ["done" "done"] results))
-    (is (= 2 (count prompts)))
-    (is (= (first prompts) (second prompts)))
-    (is (= 5 (count commands)))
-    (doseq [line ["Working directory: /fixture" "Is git repository: true"
-                 "Git branch: feature-before" "Git changed files: 2"
-                 "Recent commits:\ncommit one\ncommit two" "Platform: fixture-platform"
-                 "OS version: fixture-os" "Today's date: 2026-09-08"
-                 "Model: GPT-5.2 Codex" "Knowledge cutoff: 2025-08-31"]]
-      (is (str/includes? (or block "") line) line))
-    (is (= "gpt-5.2-codex" (:model snapshot)))
-    (is (= ["gpt-5.2-codex" "gpt-5.2-codex"] (mapv :model requests)))
-    (is (str/starts-with? (first prompts) "You are an OpenAI Codex coding agent."))
-    (is (str/ends-with? (first prompts) "FINAL RULE"))))
+  (with-redefs [models/catalog fixture-catalog]
+    (let [{:keys [results prompts commands first-turn-commands requests snapshot]}
+          (capture (profiles/create-openai-profile "fixture-model"))
+          block (second (re-find #"(?s)<environment>\n(.*?)</environment>" (first prompts)))]
+      (is (= ["done" "done"] results))
+      (is (= 2 (count prompts)))
+      ;; Snapshotted once: the second turn sees the same environment even
+      ;; though every command would now answer differently, and runs none.
+      (is (= (first prompts) (second prompts)))
+      (is (seq first-turn-commands))
+      (is (= first-turn-commands commands) "second turn must not re-inspect the environment")
+      (is (= (count commands) (count (distinct commands)))
+          (str "session start must not repeat an inspection: " (pr-str commands)))
+      (doseq [line ["Working directory: /fixture" "Is git repository: true"
+                   "Git branch: feature-before" "Git changed files: 2"
+                   "Recent commits:\ncommit one\ncommit two" "Platform: fixture-platform"
+                   "OS version: fixture-os" "Today's date: 2026-09-08"
+                   "Model: Fixture Model" "Knowledge cutoff: 2024-03"]]
+        (is (str/includes? (or block "") line) line))
+      (is (= "fixture-model" (:model snapshot)))
+      (is (= ["fixture-model" "fixture-model"] (mapv :model requests)))
+      (is (str/starts-with? (first prompts) "You are an OpenAI Codex coding agent."))
+      (is (str/ends-with? (first prompts) "FINAL RULE")))))
 
 (deftest profile-metadata-and-safe-fallbacks-do-not-change-model-routing
-  (doseq [[provider model metadata display cutoff]
-          [["openai" "codex" {} "GPT-5.2 Codex" "2025-08-31"]
-           ["custom" "local-model" {:display_name "Local Model" :knowledge_cutoff "2025-01"} "Local Model" "2025-01"]
-           ["openai" "gpt-5.2-codex" {:display_name "Configured Model" :knowledge_cutoff "2025-02"} "Configured Model" "2025-02"]
-           ["custom" "codex" {} "codex" "unknown"]
-           ["custom" "unlisted" {:display_name "  " :knowledge_cutoff false} "unlisted" "unknown"]
-           ["openai" "gpt-5.2-codex" {:display_name 7 :knowledge_cutoff ""} "GPT-5.2 Codex" "2025-08-31"]
-           ["gemini" "gemini-3-flash-preview" {} "Gemini 3 Flash Preview" "unknown"]]]
-    (let [{:keys [prompts requests snapshot]} (capture (profiles/make-profile (merge {:id provider :model model} metadata)))]
-      (doseq [prompt prompts]
-        (is (str/includes? prompt (str "Model: " display "\n")))
-        (is (str/includes? prompt (str "Knowledge cutoff: " cutoff "\n"))))
-      (is (= display (:model_display_name snapshot)))
-      (is (= cutoff (:knowledge_cutoff snapshot)))
-      (is (= [model model] (mapv :model requests))))))
+  (with-redefs [models/catalog fixture-catalog]
+    (doseq [[provider model metadata display cutoff]
+            [["openai" "fx" {} "Fixture Model" "2024-03"]
+             ["custom" "local-model" {:display_name "Local Model" :knowledge_cutoff "2025-01"} "Local Model" "2025-01"]
+             ["openai" "fixture-model" {:display_name "Configured Model" :knowledge_cutoff "2025-02"} "Configured Model" "2025-02"]
+             ;; An alias only resolves under its own provider.
+             ["custom" "fx" {} "fx" "unknown"]
+             ["custom" "unlisted" {:display_name "  " :knowledge_cutoff false} "unlisted" "unknown"]
+             ["openai" "fixture-model" {:display_name 7 :knowledge_cutoff ""} "Fixture Model" "2024-03"]
+             ["gemini" "fixture-no-cutoff" {} "Fixture No Cutoff" "unknown"]]]
+      (let [{:keys [prompts requests snapshot]} (capture (profiles/make-profile (merge {:id provider :model model} metadata)))]
+        (doseq [prompt prompts]
+          (is (str/includes? prompt (str "Model: " display "\n")))
+          (is (str/includes? prompt (str "Knowledge cutoff: " cutoff "\n"))))
+        (is (= display (:model_display_name snapshot)))
+        (is (= cutoff (:knowledge_cutoff snapshot)))
+        (is (= [model model] (mapv :model requests)))))))
 
 (deftest matching-catalog-metadata-is-used-below-profile-overrides
   ;; Synthetic catalog facts exercise precedence without inventing real dates.
@@ -76,14 +95,11 @@
         (is (= cutoff (:knowledge_cutoff snapshot)))))))
 
 (deftest catalog-cutoffs-are-sourced-or-unknown
-  ;; Every recorded cutoff must be traceable to docs/model-catalog-sources.md;
-  ;; unlisted models stay "unknown" rather than estimated.
-  (let [sources (io/slurp "docs/model-catalog-sources.md")]
-    (doseq [entry models/catalog]
-      (if-let [cutoff (:knowledge_cutoff entry)]
-        (is (str/includes? sources (str "| " (:id entry) " | " cutoff))
-            (str (:id entry) " cutoff must be listed with its source"))
-        (is (str/includes? sources (:id entry))
-            (str (:id entry) " must be listed as not recorded"))))
-    (is (= "2025-08-31" (:knowledge_cutoff (models/get-model-info "gpt-5.2-codex"))))
-    (is (nil? (:knowledge_cutoff (models/get-model-info "gemini-3-flash-preview"))))))
+  ;; A cutoff is a vendor-published fact, so each one carries the page it
+  ;; came from; a model without a published cutoff records neither.
+  (doseq [entry models/catalog]
+    (if (:knowledge_cutoff entry)
+      (is (str/starts-with? (str (:knowledge_cutoff_source entry)) "https://")
+          (str (:id entry) " records a cutoff without its source"))
+      (is (nil? (:knowledge_cutoff_source entry))
+          (str (:id entry) " cites a source for a cutoff it does not record")))))
