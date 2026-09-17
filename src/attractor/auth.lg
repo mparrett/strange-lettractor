@@ -260,8 +260,13 @@
 (defn- discover-server-metadata [transport issuer opts]
   (when-not (str/starts-with? (str issuer) "https://")
     (fail! :auth-endpoint-not-https {:reason :issuer-must-be-https}))
-  (let [candidates [(str issuer "/.well-known/oauth-authorization-server")
-                    (str issuer "/.well-known/openid-configuration")]]
+  (let [resource-url (str (:resource-url opts))
+        bare (str/replace resource-url #"^https://" "")
+        host (first (str/split bare #"/"))
+        path (str/join "/" (rest (str/split bare #"/")))
+        candidates [(str issuer "/.well-known/oauth-authorization-server")
+                    (str issuer "/.well-known/openid-configuration")
+                    (str "https://" host "/.well-known/oauth-authorization-server/" path)]]
     (loop [remaining candidates]
       (if (empty? remaining)
         (fail! :auth-discovery-failed {:reason :server-metadata-not-found})
@@ -573,7 +578,8 @@
         endpoints (if (and (non-blank-string? (:authorization-endpoint resolved))
                            (non-blank-string? (:token-endpoint resolved)))
                     (assoc resolved :token-auth-methods nil)
-                    (let [discovered (resolve-endpoints transport resource-url resolved options)]
+                    (let [discovered (resolve-endpoints transport resource-url resolved
+                                             (assoc options :resource-url resource-url))]
                       (check-public-client! (:token-auth-methods discovered))
                       discovered))]
     (when-not (and (non-blank-string? (:authorization-endpoint endpoints))
