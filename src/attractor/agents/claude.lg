@@ -83,11 +83,18 @@
           ;; can append its last record between EOF and completion observation.
           (let [completed-before-read (realized? completion)]
           (if-let [chunk (core/read-bytes @reader 4096)]
-            (let [size (+ total (count (bytes chunk))) parts (str/split (str pending chunk) #"\n")]
+            ;; Frame on the last newline rather than on what split leaves behind:
+            ;; Java-style split drops a trailing empty string, which would hold
+            ;; the final complete record back as if it were unfinished.
+            (let [size (+ total (count (bytes chunk)))
+                  buffer (str pending chunk)
+                  cut (str/last-index-of buffer "\n")
+                  complete (if cut (subs buffer 0 cut) "")
+                  unfinished (if cut (subs buffer (inc cut)) buffer)]
               (when (> size 16777216) (fail! :claude-output-limit "Claude stdout exceeds 16 MiB"))
-              (doseq [line (butlast parts)] (when-not (str/blank? line) (record! line)))
-              (when (> (count (bytes (last parts))) 1048576) (fail! :claude-output-limit "Claude record exceeds 1 MiB"))
-              (recur (last parts) size))
+              (doseq [line (str/split complete #"\n")] (when-not (str/blank? line) (record! line)))
+              (when (> (count (bytes unfinished)) 1048576) (fail! :claude-output-limit "Claude record exceeds 1 MiB"))
+              (recur unfinished size))
             (if completed-before-read
               (let [done @completion result (:value done)]
                 (when (:error done) (throw (:error done)))
