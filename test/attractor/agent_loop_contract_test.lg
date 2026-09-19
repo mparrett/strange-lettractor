@@ -134,3 +134,63 @@
                                 (:messages (last @requests)))))))
         (is (= :idle (:state @session)))
         (finally (agent/close-session! session))))))
+
+(deftest total-token-limit-caps-loop-when-cumulative-usage-exceeds-cap
+  (let [calls (atom 0) events (atom [])
+        session (fixture
+                  (fn [_]
+                    (let [n (swap! calls inc)]
+                      ;; Each response has 5 total tokens (2 input + 3 output)
+                      (response (str n) "answer"
+                                [{:id (str "c" n) :name "step" :arguments {}}])))
+                  (fn [_ _] "ok")
+                  {:max_total_tokens 12 :max_tool_rounds_per_input 10
+                   :enable_loop_detection false :on_event #(swap! events conj %)})]
+    (try
+      ;; First turn: 5 tokens, total 5 (check: 0 < 12, make call)
+      ;; Second turn: 5 tokens, total 10 (check: 5 < 12, make call)
+      ;; Third turn: 5 tokens, total 15 (check: 10 < 12, make call - OVERSHOOT)
+      (agent/process-input! session "input")
+      (is (= :idle (:state @session)))
+      (is (= 3 @calls)) ;; Should stop before third call
+      (let [token-events (filter #(= :token_limit (:type %)) @events)]
+        (is (= 1 (count token-events)))
+        (is (= 15 (:total_tokens (first token-events))))
+        (is (= 12 (:limit (first token-events)))))
+      (finally (agent/close-session! session)))))
+
+(deftest zero-max-total-tokens-means-unlimited
+  (let [calls (atom 0) events (atom [])
+        session (fixture
+                  (fn [_]
+                    (let [n (swap! calls inc)]
+                      (response (str n) "answer"
+                                (if (< n 5) [{:id (str "c" n) :name "step" :arguments {}}] []))))
+                  (fn [_ _] "ok")
+                  {:max_total_tokens 0 :max_tool_rounds_per_input 10
+                   :enable_loop_detection false :on_event #(swap! events conj %)})]
+    (try
+      (agent/process-input! session "input")
+      (is (= :idle (:state @session)))
+      ;; With unlimited tokens and 4 tool rounds, should get 5 calls (rounds + final answer)
+      (is (= 5 @calls))
+      (let [token-events (filter #(= :token_limit (:type %)) @events)]
+        (is (= 0 (count token-events))))
+      (finally (agent/close-session! session)))))
+
+(deftest max-total-tokens-passed-to-subagent
+  (let [session (fixture
+                  (fn [_] (response "1" "done" []))
+                  (fn [_ _] "ok")
+                  {:max_subagent_depth 1})]
+    (try
+      (let [registry (get-in @session [:provider_profile :tool_registry])]
+        (is (contains? (:properties (get-in (profiles/get-tool registry "spawn_agent")
+                                            [:definition :parameters]))
+                       :max_total_tokens)))
+      (let [agent-id (:agent_id (agent/spawn-subagent!
+                                  session {"task" "child" "max_total_tokens" 7}))
+            _ (agent/wait-subagent! session agent-id)
+            child (get-in @session [:subagents agent-id :session])]
+        (is (= 7 (get-in @child [:config :max_total_tokens]))))
+      (finally (agent/close-session! session)))))

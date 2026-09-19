@@ -420,6 +420,7 @@
                  :config (assoc
                            (merge {:max_turns 0
                                    :max_tool_rounds_per_input 0
+                                   :max_total_tokens 0
                                    :default_command_timeout_ms 10000
                                    :max_command_timeout_ms 600000
                                    :reasoning_effort nil
@@ -911,6 +912,19 @@
               true)))
     (event-fn {:type :processing_end})))
 
+;; Tokens the session has spent so far. A provider that reports no total is
+;; counted as input plus output; one that reports no usage counts as zero.
+(defn- sum-usage-tokens [history]
+  (reduce (fn [total turn]
+            (let [usage (:usage turn)
+                  reported (or (:total_tokens usage) 0)]
+              (+ total
+                 (if (> reported 0)
+                   reported
+                   (+ (or (:input_tokens usage) 0) (or (:output_tokens usage) 0))))))
+          0
+          (filter #(= :assistant (:type %)) history)))
+
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn- process-input-cycle! [session prompt on-event followup? & [invocation]]
   (let [event-fn (fn [event] (emit-event! session event on-event))
@@ -948,7 +962,8 @@
                 (fn [request] (with-retry #(llm/client-complete client request))))
               (fn [request] (llm/complete request))))
         round-limit (or (:max_tool_rounds_per_input config) 0)
-        turn-limit (or (:max_turns config) 0)]
+        turn-limit (or (:max_turns config) 0)
+        token-limit (or (:max_total_tokens config) 0)]
     (when-not
       (with-session-lock
         session
@@ -985,7 +1000,8 @@
           (loop [round-count 0
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
-                                                 (:history @session)))]
+                                                 (:history @session)))
+                  total-tokens (sum-usage-tokens (:history @session))]
               (cond
                 (session-stopped? session) last-text
 
@@ -995,6 +1011,13 @@
                   (check-context-usage! session event-fn)
                   (event-fn {:type :turn_limit :round round-count
                              :total_turns assistant-count})
+                  last-text)
+
+                (and (> token-limit 0) (>= total-tokens token-limit))
+                (do
+                  (check-context-usage! session event-fn)
+                  (event-fn {:type :token_limit :total_tokens total-tokens
+                             :limit token-limit})
                   last-text)
 
                 :else
@@ -1280,6 +1303,7 @@
              :llm_client (:llm_client @parent)
              :complete_fn (get-in @parent [:config :complete_fn])
              :max_turns (or (subagent-arg arguments "max_turns") 0)
+             :max_total_tokens (or (subagent-arg arguments "max_total_tokens") 0)
              :max_tool_rounds_per_input
              (get-in @parent [:config :max_tool_rounds_per_input])
              :max_subagent_depth max-depth
@@ -1343,6 +1367,7 @@
            "spawn_agent" "Spawn a scoped coding subagent with optional skill selection"
            {:task {:type "string"} :working_dir {:type "string"}
             :model {:type "string"} :max_turns {:type "integer"}
+            :max_total_tokens {:type "integer"}
             :skills {:type "array" :items {:type "string"}}}
            ["task"]
            (fn [arguments _] (spawn-subagent! session arguments)))
