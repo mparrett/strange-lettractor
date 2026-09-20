@@ -2,15 +2,15 @@
 
 Strange Lettractor is a unified agentic framework for building provider-independent LLM applications, tool-using agents, and composable workflows in [let-go](https://github.com/nooga/let-go). It implements [StrongDM's Attractor specifications](https://github.com/strongdm/attractor) across three complementary layers:
 
-- [Unified LLM client](docs/upstream/strongdm-attractor/unified-llm-spec.md): a common interface across OpenAI, Anthropic, and Google Gemini for multimodal generation, first-class streaming, structured output, and tool calling, using native provider APIs and explicit access to provider-specific capabilities.
-- [Coding agent runtime](docs/upstream/strongdm-attractor/coding-agent-loop-spec.md): stateful agent sessions that combine model calls, tools, and execution environments.
-- [Workflow orchestration](docs/upstream/strongdm-attractor/attractor-spec.md): composable Graphviz DOT pipelines with branching, parallel execution, human interaction, and checkpoint recovery.
+- [Unified LLM client](specs/unified-llm-spec.md): a common interface across OpenAI, Anthropic, and Google Gemini for multimodal generation, first-class streaming, structured output, and tool calling, using native provider APIs and explicit access to provider-specific capabilities.
+- [Coding agent runtime](specs/coding-agent-loop-spec.md): stateful agent sessions that combine model calls, tools, and execution environments.
+- [Workflow orchestration](specs/attractor-spec.md): composable Graphviz DOT pipelines with branching, parallel execution, human interaction, and checkpoint recovery.
 
 Applications can use the LLM client and agent runtime directly, without a DOT workflow. Workflow orchestration builds on those foundations; it does not define the framework's entire scope.
 
 ## Conformance to the upstream README
 
-The upstream [README](docs/upstream/strongdm-attractor/README.md) asks for an
+The upstream [README](https://github.com/strongdm/attractor) asks for an
 implementation of its three NLSpecs and recommends bringing your own agentic
 loop and unified LLM SDK rather than wrapping a vendor's. Strange Lettractor
 does both, in let-go:
@@ -97,7 +97,7 @@ OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 OPENAI_COMPAT_API_KEY=local \
 For a persistent hub, run `bin/attractor hub --mock --port 4555` in one terminal
 and attach with `console --connect 4555` in another. Quitting a client preserves
 hub work; `bin/attractor hub --stop 4555` shuts down the host. See
-[nREPL hub usage](docs/nrepl-hub.md) for model configuration and embedding.
+[nREPL hub usage](docs/_archive/nrepl-hub.md) for model configuration and embedding.
 
 Inside the console:
 
@@ -114,7 +114,7 @@ Inside the console:
 
 In the TUI, Ctrl-C discards a multiline draft, cancels busy focused work, or
 quits when idle. Human-gated workflows need `--auto-approve` for now. See
-[console requirements and evidence](docs/console-requirements.md).
+[console requirements and evidence](docs/_archive/console-requirements.md).
 
 ### Pipelines
 
@@ -184,8 +184,8 @@ bin/attractor agent codex  --prompt-file examples/claude-smoke.md --cwd . --sand
 
 Both stream identified EDN events and default to read-only access. DOT runs
 select an agent with `--agent <name>`; the console with `/agent <name>`. See
-[Claude Code agent](docs/claude-agent.md) and
-[Codex app-server agent](docs/codex-app-server.md).
+[Claude Code agent](docs/_archive/claude-agent.md) and
+[Codex app-server agent](docs/_archive/codex-app-server.md).
 
 ## Workflow lifecycle
 
@@ -201,7 +201,7 @@ even if the original DOT file has changed or disappeared. Source changes produce
 drift warnings; missing or corrupt captures stop recovery before execution.
 Loop restarts retain independently resumable captures in their fresh run directories.
 
-[Tool-call hooks](docs/tool-hooks.md) provide pre-call checks and post-call auditing,
+[Tool-call hooks](docs/_archive/tool-hooks.md) provide pre-call checks and post-call auditing,
 with graph/node configuration and EDN stage logs.
 
 ## License

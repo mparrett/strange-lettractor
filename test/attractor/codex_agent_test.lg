@@ -1,5 +1,6 @@
 (ns attractor.codex-agent-test
   (:require [harness.runtime :as runtime-path]
+            [harness.deadline :as deadline]
             [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
             [attractor.agents.codex :as worker]))
 
@@ -34,8 +35,11 @@
         events (atom [])
         job (core/future (attempt {:prompt "slow" :command (command "agent-hang") :timeout_ms 8000
                                    :cancelled? (fn [] @cancel) :on_event #(swap! events conj %)}))]
-    ;; The hanging turn only ends through turn/interrupt.
-    (core/sleep 400)
+    ;; The hanging turn only ends through turn/interrupt. Cancel once the turn
+    ;; is demonstrably under way: a fixed sleep assumes a spawn and handshake
+    ;; that a loaded machine does not finish in time, and cancelling before the
+    ;; turn starts tests nothing.
+    (is (deadline/wait-until #(seq @events) 30000) "the turn started")
     (reset! cancel true)
-    (is (= :cancelled (get-in (deref job 6000 {:error {:category :test-timeout}}) [:error :category])))
+    (is (= :cancelled (get-in (deref job 30000 {:error {:category :test-timeout}}) [:error :category])))
     (is (some #(= "interrupted" (get-in % [:event "params" "turn" "status"])) @events) "interrupt reached the server")))

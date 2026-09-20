@@ -92,6 +92,5 @@ automatic local-to-frontier escalation, paired development review, CSS custom
 properties, and console job/context controls are user-requested extensions.
 Their unfinished work must not be counted as unimplemented StrongDM requirements.
 
-Sources: `docs/upstream/strongdm-attractor/{attractor-spec,coding-agent-loop-spec,
-unified-llm-spec}.md`; `docs/superpowers/iterations/requirements/*.md`;
+Sources: `specs/{attractor-spec,coding-agent-loop-spec,unified-llm-spec}.md`; `docs/superpowers/iterations/requirements/*.md`;
 `docs/coding-agent-definition-of-done.md`; `evidence/provider-matrix-evidence.edn`.

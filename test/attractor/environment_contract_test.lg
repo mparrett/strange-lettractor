@@ -276,7 +276,10 @@
   ;; The wrapper's helpers (timeout watchdog, cancel-marker poller) must not
   ;; outlive it: a poller orphaned by a killed wrapper spins forever.
   (let [root (fresh-root "orphans")
-        needle "37.4242"
+        ;; Unique per run: the needle is matched against the whole process
+        ;; table, so a fixed one also finds the helpers of a concurrent or
+        ;; just-finished run and the emptiness check can never hold.
+        needle (str "37." (+ 100000 (mod (System/currentTimeMillis) 900000)))
         environment (execution/make-local-environment {:working_dir root})
         job (core/future (exec environment (str "sleep " needle) 60000))]
     (try

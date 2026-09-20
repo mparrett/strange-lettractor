@@ -7,8 +7,11 @@
 (def mode (or (first *command-line-args*) "normal"))
 (def delay-ms (if (second *command-line-args*)
                 (parse-long (second *command-line-args*)) 150))
+;; The safety deadline only has to beat an orphan, so it is far wider than any
+;; caller's own timeout: on a loaded machine the child's own startup can eat a
+;; ten-second budget and the parent then reports a handshake that never failed.
 (def lifetime-ms (if (nth *command-line-args* 2 nil)
-                   (parse-long (nth *command-line-args* 2)) 10000))
+                   (parse-long (nth *command-line-args* 2)) 60000))
 ;; Even ignore-eof cannot leave a permanent child after a broken transport test.
 (future (sleep lifetime-ms) (os/exit 124))
 
