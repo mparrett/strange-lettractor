@@ -3,7 +3,7 @@
 # strange-lettractor container build: bin/attractor, run as `attractor serve`.
 #
 # Three stages, mirroring README "Prerequisites":
-#   1. runtime — the pinned, patched let-go fork compiled to a static `lg`
+#   1. runtime — upstream let-go at the pinned release tag, static `lg`
 #   2. app     — lgx installs tiny-tui and bundles main.lg into bin/attractor
 #   3. final   — a slim image carrying only bin/attractor plus the tools it
 #                shells out to at run time
@@ -16,18 +16,27 @@
 # possible; the default is the deploy target.
 
 ARG PLATFORM=linux/amd64
-ARG LETGO_REPO=https://github.com/nnunley/let-go.git
-ARG LETGO_SHA=46244c4fa8169b8138aa1c29f31c8a6102ed1755
+# let-go v1.13.0 is the floor: it is the first release carrying net/listen,
+# net/accept and net/local-address (#896) and the JSON string-key fix (#820),
+# which auth.lg's loopback listener and the LLM clients need. Both used to be
+# carried here as patches over a fork SHA; they are upstream now.
+ARG LETGO_REPO=https://github.com/nooga/let-go.git
+ARG LETGO_VERSION=1.13.0
+ARG LETGO_SHA=369e2a6900a46e77f9afb5878ab9845f52536b0e
 ARG LGX_VERSION=0.2.1
-ARG GO_IMAGE=golang:1.26.5-bookworm
+# Tracks let-go's go.mod: v1.13.0 declares `go 1.27` / `toolchain go1.27.1`,
+# up from 1.26 in v1.12.2. The golang images set GOTOOLCHAIN=local, so a lower
+# image does not silently download a newer toolchain — it fails the build.
+ARG GO_IMAGE=golang:1.27.1-bookworm
 ARG BASE_IMAGE=debian:bookworm-slim
 
 # ---------------------------------------------------------------------------
-# 1. runtime: patched let-go at the pinned revision
+# 1. runtime: let-go at the pinned release revision
 # ---------------------------------------------------------------------------
 FROM --platform=${PLATFORM} ${GO_IMAGE} AS runtime
 ARG LETGO_REPO
 ARG LETGO_SHA
+ARG LETGO_VERSION
 WORKDIR /src/let-go
 # Fetch exactly the pinned commit rather than cloning history; GitHub serves
 # arbitrary reachable SHAs, so this stays reproducible without a branch name.
@@ -35,17 +44,19 @@ RUN git init -q . \
  && git remote add origin "${LETGO_REPO}" \
  && git fetch -q --depth 1 origin "${LETGO_SHA}" \
  && git checkout -q --detach FETCH_HEAD
-COPY runtime-patches/ /src/runtime-patches/
-RUN git apply --check /src/runtime-patches/net-listener.patch /src/runtime-patches/json-string-keys.patch \
- && git apply /src/runtime-patches/net-listener.patch /src/runtime-patches/json-string-keys.patch
 # CGO off: let-go has no cgo dependencies, and a static binary is what lets the
 # final stage be a slim Debian rather than a matching glibc toolchain image.
+# The ldflags mirror let-go's own .goreleaser.yml: without them a source build
+# reports version "dev", so `lg version` inside the image would not say which
+# release this is.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/lg .
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+      -ldflags "-s -w -X main.version=${LETGO_VERSION} -X main.commit=${LETGO_SHA}" \
+      -o /out/lg .
 
 # ---------------------------------------------------------------------------
-# 2. app: lgx install + lgx build against the patched runtime
+# 2. app: lgx install + lgx build against the pinned runtime
 # ---------------------------------------------------------------------------
 FROM --platform=${PLATFORM} ${BASE_IMAGE} AS app
 ARG LGX_VERSION
@@ -63,9 +74,11 @@ RUN --mount=type=tmpfs,target=/dl \
     tar -xzf "${tarball}"; \
     install -m 0755 "$(find . -maxdepth 2 -type f -name lgx | head -1)" /usr/local/bin/lgx
 COPY --from=runtime /out/lg /usr/local/bin/lg
-# lgx.edn pins :lg-version 1.12.2 for the stock runtime; the patched fork build
-# reports a dev version, and the Makefile's LGX_LG override is the documented
-# way to run against it. Skip the pin check for the same reason.
+# lgx.edn still pins :lg-version 1.12.2, which predates net/listen; this image
+# deliberately runs 1.13.x. LGX_LG is the Makefile's documented way to point
+# lgx at a specific lg, and the pin check is skipped because the mismatch is
+# the intent. Both can go once upstream's lgx.edn moves to 1.13.x — which is
+# blocked on test/runner.lg, written against the pre-#863 `test` namespace.
 ENV LGX_LG=/usr/local/bin/lg \
     LGX_SKIP_VERSION_CHECK=1
 WORKDIR /src/app
