@@ -1,16 +1,18 @@
 (ns main
-  "Focused test runner: test namespaces in one process, each test var
-   under its fixtures. The full suite is `lgx test`.
+  "Test entry point: load the named test namespaces and hand them to
+   clojure.test, which owns execution, fixtures and reporting.
      lg -source-paths src:test test/runner.lg attractor.providers-test [more...]
-     lg -source-paths src:test test/runner.lg --all [--verbose]
-   Output: one line per failing test with its detail, then a summary
-   (--verbose lists passing tests too). Exits 0 on success, 1 on failure.
+     lg -source-paths src:test test/runner.lg --all
+   Exits 0 on success, 1 on failure.
+
+   `lgx test` cannot be used instead: lgx 0.3.0 ships a harness written
+   against let-go's pre-1.13.0 test namespace, so it fails to compile on
+   1.13.0. lgx PR #52 ports it; revisit this file once that ships.
 
    There is no default deadline: a test that can hang bounds itself.
    `--deadline-ms N` is for chasing a hang: past N the run exits 124 and
-   names the test that was running."
-  (:require [test :refer [*registered-tests* *report-counters*
-                          *test-result* *each-fixtures*]]
+   names the namespace that was running."
+  (:require [clojure.test :as test]
             [clojure.string :as str]
             [os :as os]
             [harness.deadline :as deadline]))
@@ -21,40 +23,13 @@
        sort
        (mapv #(str "attractor." (str/replace (subs % 0 (- (count %) 3)) "_" "-")))))
 
-(defn- compose-fixtures [f g] (fn [t] (f (fn [] (g t)))))
-(defn- join-fixtures [fixtures]
-  (reduce compose-fixtures (fn [t] (t)) fixtures))
-
-(defn- var-name [test-var]
-  (last (str/split (str test-var) #"/")))
-
-(defn- detail-lines [output]
-  (remove #(or (str/blank? %) (str/starts-with? % "PASS ") (str/starts-with? % "Testing: "))
-          (str/split (str output) #"\n")))
-
-(defn- run-test-var! [test-var]
-  (set! *report-counters* (update *report-counters* :test inc))
-  (let [before *report-counters*
-        result (try
-                 {:out (with-out-str
-                         ((join-fixtures *each-fixtures*) (fn [] ((deref test-var)))))}
-                 (catch Object error
-                   (set! *report-counters* (update *report-counters* :error inc))
-                   (set! *test-result* false)
-                   {:out "" :error error}))
-        after *report-counters*]
-    (assoc result :failed? (or (> (:fail after) (:fail before))
-                               (> (:error after) (:error before))))))
-
 (defn -main [& raw-args]
-  (let [flags #{"--all" "--verbose"}
-        all? (boolean (some #(= "--all" %) raw-args))
-        verbose? (boolean (some #(= "--verbose" %) raw-args))
+  (let [all? (boolean (some #(= "--all" %) raw-args))
         {:keys [timeout-ms args]} (deadline/split-args
-                                    (remove flags raw-args) nil)
+                                    (remove #{"--all"} raw-args) nil)
         names (if all? (all-test-namespaces) args)]
     (when (empty? names)
-      (println "usage: test/runner.lg <namespace> [namespace...] | --all   [--deadline-ms N] [--verbose]")
+      (println "usage: test/runner.lg <namespace> [namespace...] | --all   [--deadline-ms N]")
       (os/exit 2))
     (let [running (atom "startup")
           watch (when timeout-ms
@@ -65,21 +40,13 @@
         (doseq [n names]
           (reset! running (str "load of " n))
           (require (symbol n))))
-      (doseq [n names
-              test-var (get *registered-tests* (the-ns (symbol n)) [])]
-        (reset! running (str n "/" (var-name test-var)))
-        (let [{:keys [failed? out error]} (run-test-var! test-var)]
-          (cond
-            failed? (do (println (str "✗ " n "/" (var-name test-var)))
-                        (doseq [line (detail-lines out)] (println (str "    " line)))
-                        (when error (println (str "    ERROR: " error))))
-            verbose? (println (str "✓ " n "/" (var-name test-var))))))
-      (when watch ((:cancel! watch)))
-      (let [counters *report-counters*
-            failures (+ (:fail counters) (:error counters))]
-        (prn counters)
-        (println (str (:test counters) " tests, " (+ (:pass counters) (:fail counters))
-                      " assertions, " failures " failures"))
+      (reset! running (str/join ", " names))
+      (let [summary (apply test/run-tests (map symbol names))
+            failures (+ (:fail summary) (:error summary))]
+        (when watch ((:cancel! watch)))
+        ;; Key order is a contract: test/runners.sh greps this line.
+        (prn (array-map :error (:error summary) :fail (:fail summary)
+                        :pass (:pass summary) :test (:test summary)))
         (os/exit (if (zero? failures) 0 1))))))
 
 (when *command-line-args* (apply -main *command-line-args*))

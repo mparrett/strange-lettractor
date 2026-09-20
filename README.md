@@ -23,13 +23,13 @@ does both, in let-go:
 | "Build your own software factory" | `bin/attractor run`, `console`, `agent`, `serve` | [tutorial](docs/tutorial.md), [behavior corpus](docs/superpowers/iterations/behavior-corpus.md) |
 
 The ledgers and audits distinguish tested behavior from remaining requirements;
-the full suite is `lgx test` (`make test`). Native-provider live coverage and full schema
+the full suite is `lgx suite` (`make test`). Native-provider live coverage and full schema
 conformance remain incomplete. See the [current specification audit](docs/original-spec-status.md)
 for verified results and remaining gaps. Historical story counts alone do not
 establish full specification conformance.
 
-It is built with [lgx](https://github.com/abogoyavlensky/lgx) and uses the pinned,
-patched let-go runtime described below.
+It is built with [lgx](https://github.com/abogoyavlensky/lgx) and runs on a
+stock [let-go](https://github.com/nooga/let-go) release.
 
 ## Build and run
 
@@ -39,52 +39,40 @@ test commands and retention policy.
 
 Prerequisites:
 
-- [lgx](https://github.com/abogoyavlensky/lgx) 0.1.0-rc2 or newer.
-- Go 1.26.5 to build the runtime. From this Attractor checkout, clone the pinned
-  [let-go fork revision](https://github.com/nnunley/let-go/commit/46244c4fa8169b8138aa1c29f31c8a6102ed1755),
-  apply the tracked TCP-listener and JSON-key patches, then point `LGX_LG` at
-  the resulting executable:
-
-  ```sh
-  git clone https://github.com/nnunley/let-go.git .worktrees/let-go-pinned
-  git -C .worktrees/let-go-pinned checkout --detach 46244c4fa8169b8138aa1c29f31c8a6102ed1755
-  git -C .worktrees/let-go-pinned apply --check \
-    "$PWD/runtime-patches/net-listener.patch" \
-    "$PWD/runtime-patches/json-string-keys.patch"
-  git -C .worktrees/let-go-pinned apply \
-    "$PWD/runtime-patches/net-listener.patch" \
-    "$PWD/runtime-patches/json-string-keys.patch"
-  (cd .worktrees/let-go-pinned && go build -o build/lg .)
-  export LGX_LG="$PWD/.worktrees/let-go-pinned/build/lg"
-  ```
-
-  The pinned revision supplies the evaluation, reader, cancellation, and timeout
-  fixes. The two additional patches supply the native nREPL listener and correct
-  JSON object keys. Run the clone/apply steps once in a new destination; reuse
-  the resulting binary for subsequent Attractor builds. See
-  [runtime build evidence](docs/runtime-build-audit.md) and
-  [upstream follow-ups](docs/let-go-followups.md) for release status.
+- [let-go](https://github.com/nooga/let-go) 1.13.0 on `PATH` as `lg`. That
+  release carries everything Attractor needs, including the native TCP listener
+  and correct JSON object keys that this project previously had to patch in
+  locally. `lgx.edn` pins the version; lgx refuses to run on a mismatch.
+- [lgx](https://github.com/abogoyavlensky/lgx) 0.3.0 or newer.
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
   OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for
   live models, addressed as `openai-compat/<model>`.
 
 Provider keys and live-runner options come from `.env` in the working
-directory; `.env.sample` lists every variable the code reads. Every command
-below reads the runtime from `LGX_LG`; the `lg` on your `PATH` may be older,
-so always set it:
+directory; `.env.sample` lists every variable the code reads. Set `LGX_LG` only
+to override the runtime with a local let-go build.
+
+Every entry point is an lgx task; `lgx help` lists them, and the Makefile is a
+thin passthrough over the same tasks.
 
 ```sh
-# or use the Makefile: make build, make test, make run-providers, make models
 # Layout: src/ code; test/attractor/ suites; test/fixtures/ loopback servers;
 # test/live/ credential-gated gates; test/probes/ manual checks and let-go
-# issue reproducers; test/runner.lg runs one namespace in isolation.
-export LGX_LG=/path/to/let-go/build/lg   # the fixed local build
-lgx install                              # fetches tiny-tui (pinned in lgx.edn)
-lgx build                                # bin/attractor
-lgx test                                 # full suite (~3 min)
+# issue reproducers; test/runner.lg is the suite entry point.
+lgx install            # fetches tiny-tui (pinned in lgx.edn)
+lgx rebuild            # bin/attractor      (make build)
+lgx suite              # full suite, ~2.5 min  (make test)
+lgx test-ns attractor.validation-test   # one namespace   (make run-validation)
+lgx runners            # each namespace in its own process (make runners)
 bin/attractor help
 ```
+
+`lgx test`, lgx's own bundled harness, does not work on let-go 1.13.0: it is
+written against the `test` namespace that 1.13.0 replaced with a `clojure.test`
+port. [lgx#52](https://github.com/abogoyavlensky/lgx/pull/52) fixes it. Until
+that ships, `lgx suite` runs `test/runner.lg`, which hands the namespaces to
+`clojure.test/run-tests`.
 
 Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
 

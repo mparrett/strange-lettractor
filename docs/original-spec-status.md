@@ -1,4 +1,4 @@
-# Original-spec status — 2026-09-11
+# Original-spec status — 2026-09-11 (runtime entry updated 2026-09-20)
 
 This is a reconciliation of existing records, not a fresh completion audit.
 
@@ -78,14 +78,14 @@ Remaining original-scope closure work:
   OpenAI Responses and Anthropic Messages protocol runs, plus a Gemini model run
   through OpenRouter; that last file does not establish Gemini native-protocol
   parity. Existing artifacts still require requirement-by-requirement assessment.
-- Runtime build reproducibility is now verified from a fresh clone of pinned
-  fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755` plus the two tracked
-  patches. The full suite, build, listener probe, and compiled nREPL attachment
-  pass. A stock upstream release containing the required changes remains
-  unavailable; recheck reader, cancellation, and HTTP timeout behavior when
-  moving to one. `let-go-followups.md` records the remaining upstream items and
-  historical restoration notes; `runtime-build-audit.md` records the supported
-  build that no longer depends on the old ignored source snapshot.
+- Closed 2026-09-20: the release-runtime gap. let-go 1.13.0 carries the native
+  TCP listener and the JSON object-key fix, so the two tracked patches and the
+  pinned fork revision are gone; `runtime-patches/` is deleted and `lgx.edn`
+  pins 1.13.0. The full suite passes on the stock release with no `LGX_LG`:
+  1336 tests, 10884 assertions, zero failures. Reader, cancellation and HTTP
+  timeout behavior are exercised by that suite. Not covered by this run: the
+  standalone listener probe and compiled nREPL attachment, which were last
+  verified against the patched build.
 
 Scope distinction: recursive context-budgeted development planning/execution,
 automatic local-to-frontier escalation, paired development review, CSS custom

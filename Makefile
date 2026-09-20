@@ -1,10 +1,8 @@
 # Strange Lettractor build entry points.
 #
-# Everything runs on the fixed local let-go runtime named by LGX_LG. Set it in
-# the environment, in .env (LGX_LG=...), or on the command line:
-#   make build LGX_LG=/path/to/let-go/build/lg
-# Without it, the runtime is looked up next to this checkout (the
-# let-go-http-cancellation workspace used during development).
+# This Makefile is a thin passthrough: every target forwards to an lgx task,
+# and lgx.edn owns the definitions (runtime version, source paths, arguments).
+# `lgx help` lists the same entry points; use either.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -12,80 +10,57 @@ SHELL := /bin/bash
 -include .env
 export
 
-ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-CANDIDATES := $(ROOT).worktrees/let-go-http-cancellation/build/lg \
-              $(ROOT)../let-go-http-cancellation/build/lg
-LGX_LG ?= $(firstword $(wildcard $(CANDIDATES)))
-LG := $(LGX_LG)
 LGX := lgx
-TINY_TUI := $(firstword $(wildcard $(HOME)/.lgx/gitlibs/github.com/abogoyavlensky/tiny-tui/*/src))
-SOURCE_PATHS := src:test$(if $(TINY_TUI),:$(TINY_TUI))
-RUNNER := test/runner.lg
 
-TEST_FILES := $(wildcard test/attractor/*_test.lg)
+.PHONY: help install hooks build test suite runners live-matrix live-parity \
+        live-smoke live-mcp-pilot live-mcp-pilot-live providers models clean distclean
 
-.PHONY: help check-runtime install hooks build test suite runners live-matrix live-smoke \
-        providers models clean distclean
+help: ## Show the lgx entry points
+	@$(LGX) help
 
-help: ## Show this help
-	@awk 'BEGIN {FS = ":.*##"; printf "Targets (runtime: %s)\n", "$(LG)"} \
-	     /^[a-zA-Z_-]+:.*?##/ { printf "  %-14s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@printf "  %-14s %s\n" "run-<name>" "One test namespace: make run-providers runs attractor.providers-test"
-
-check-runtime: ## Fail unless LGX_LG names an executable let-go runtime
-	@test -x "$(LG)" || { echo "LGX_LG is not an executable runtime: '$(LG)'"; \
-	  echo "Build the pinned, patched let-go runtime and set LGX_LG (see README)."; exit 1; }
-	@"$(LG)" -e '(println (str "let-go " (or (System/getProperty "lg.version") "ok")))' >/dev/null 2>&1 || true
-
-install: check-runtime ## Fetch pinned dependencies (tiny-tui) with lgx
+install: ## Fetch pinned dependencies (tiny-tui)
 	$(LGX) install
 
-hooks: ## Gate pushes on the full suite (sets core.hooksPath to .githooks for this clone)
-	git config core.hooksPath .githooks
+hooks: ## Gate pushes on the full suite (sets core.hooksPath for this clone)
+	$(LGX) hooks
 
-build: check-runtime ## Build bin/attractor (removes the old binary first; macOS in-place rebuilds die with 137)
-	rm -f bin/attractor
-	$(LGX) build
+build: ## Build bin/attractor
+	$(LGX) rebuild
 
-test: check-runtime ## Full suite through lgx (about three minutes)
-	$(LGX) test
+test: ## Full suite (about two and a half minutes)
+	$(LGX) suite
 
 suite: test ## Alias for test
 
-runners: check-runtime ## Every test namespace in its own process, one summary line each
-	@fail=0; for f in $(TEST_FILES); do \
-	  ns=attractor.$$(basename "$$f" .lg | tr _ -); printf '%-52s ' "$$ns"; \
-	  out=$$("$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) "$$ns" 2>&1 \
-	        | grep -E -m1 '^\{:error'); \
-	  echo "$${out:-no summary line (load or runtime error)}"; \
-	  case "$$out" in *":error 0,"*":fail 0}"*) ;; *) fail=1;; esac; \
-	done; exit $$fail
+runners: ## Every test namespace in its own process, one summary line each
+	$(LGX) runners
 
-run-%: check-runtime ## One test namespace, e.g. make run-providers (attractor.providers-test)
-	"$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) attractor.$(subst _,-,$*)-test
+run-%: ## One test namespace, e.g. make run-providers (attractor.providers-test)
+	$(LGX) test-ns attractor.$(subst _,-,$*)-test
 
-live-matrix: check-runtime ## Credential-gated provider matrix (registry keys; ATTRACTOR_MATRIX_PROVIDERS=a,b to restrict)
-	"$(LG)" -source-paths src:test test/live/provider_matrix.lg run
+live-matrix: ## Credential-gated provider matrix
+	$(LGX) live-matrix
 
-live-parity: check-runtime ## Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL (provider/name)
-	"$(LG)" -source-paths src:test test/live/parity_matrix.lg run
+live-parity: ## Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL
+	$(LGX) live-parity
 
-live-smoke: check-runtime ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
-	"$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
+live-smoke: ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
+	$(LGX) live-smoke
 
-live-mcp-pilot: check-runtime ## MCP pilot dry run (no network): prints plan, exits 2
-	"$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --dry-run
-live-mcp-pilot-live: check-runtime ## LIVE MCP pilot: OAuth + read-only calls (operator browser step; no token pasting)
-	"$(LG)" -source-paths src:test test/live/mcp_pilot_trading.lg run --live
+live-mcp-pilot: ## MCP pilot dry run (no network): prints plan, exits 2
+	$(LGX) live-mcp-pilot
 
-providers: build ## Show the effective provider registry
-	bin/attractor providers
+live-mcp-pilot-live: ## LIVE MCP pilot: OAuth + read-only calls (operator browser step)
+	$(LGX) live-mcp-pilot-live
 
-models: build ## List models from every queryable provider (PROVIDER=id to narrow)
-	bin/attractor models $(if $(PROVIDER),--provider $(PROVIDER))
+providers: ## Show the effective provider registry
+	$(LGX) providers
+
+models: ## List models from every queryable provider (PROVIDER=id to narrow)
+	@if [ -n "$(PROVIDER)" ]; then $(LGX) models-for $(PROVIDER); else $(LGX) models; fi
 
 clean: ## Remove pipeline artifacts, logs and checkpoints
-	rm -rf attractor_runs
+	$(LGX) clean-runs
 
-distclean: clean ## Also remove the built binary
-	rm -f bin/attractor
+distclean: ## Also remove the built binary
+	$(LGX) clean-all
