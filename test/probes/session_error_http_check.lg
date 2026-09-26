@@ -15,7 +15,10 @@
         client (llm/make-client {:default_provider provider :providers
                   {provider (llm/make-provider-adapter provider
                               {:api_key "fixture" :base_url (str base "/" token "/" provider "/" kind)})}})
+        ;; A pinned window skips capacity discovery, which would otherwise send its own
+        ;; request to the fixture and consume the scripted first response.
         session (agent/make-session {:provider_profile profile :llm_client client :project_docs []
+                                     :context_window_size 1000000
                                      :execution_env (execution/make-environment {:cleanup #(swap! cleaned inc)})})
         category (if (= kind "auth") :authentication :context-length)]
     (try
