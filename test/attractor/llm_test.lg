@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [clojure.core :as core]
             [json :as json]
+            [os :as os]
             [attractor.llm :as llm]))
 
 (deftest test-model-catalog-supports-provider-capability-and-alias-lookups
@@ -1810,6 +1811,29 @@
     (is (= signal (:abort_signal @captured)))
     (is (= {:connect 1.0 :request 2.0 :stream_read 30.0} (:timeout @captured))
         "explicit scopes override the defaults, the rest keep them")))
+
+(deftest test-stream-read-timeout-follows-the-environment
+  (let [captured (atom nil)
+        response (json/write-json
+                   {"id" "resp" "status" "completed" "model" "gpt-test" "output" []
+                    "usage" {"input_tokens" 0 "output_tokens" 0 "total_tokens" 0}})
+        stream-read-with (fn [env request-timeout]
+                           (os/setenv "ATTRACTOR_STREAM_READ_TIMEOUT" env)
+                           (llm/openai-complete
+                             (cond-> {:model "gpt-test" :messages [{:role :user :content "go"}]
+                                      :api_key "test-key"
+                                      :transport (fn [request]
+                                                   (reset! captured request)
+                                                   {:status 200 :body response})}
+                               request-timeout (assoc :adapter_timeout request-timeout)))
+                           (:stream_read (:timeout @captured)))]
+    (try
+      (is (= 90.0 (stream-read-with "90" nil)) "the environment raises the ceiling")
+      (is (= 5.0 (stream-read-with "90" {:stream_read 5.0})) "a request's own timeout still wins")
+      (is (= 30.0 (stream-read-with "soon" nil)) "an unparseable value keeps the default")
+      (is (= 30.0 (stream-read-with "0" nil)) "a non-positive value keeps the default")
+      (is (= 30.0 (stream-read-with "" nil)) "empty means unset")
+      (finally (os/setenv "ATTRACTOR_STREAM_READ_TIMEOUT" "")))))
 
 (deftest test-stream-closes-late-registration-after-timeout
   (let [closed (atom false)

@@ -11,8 +11,22 @@
    longest silence between stream chunks."
   {:connect 10.0 :request 120.0 :stream_read 30.0})
 
+(defn- env-adapter-timeout
+  "The one adapter timeout a deployment can set from outside the library.
+   ATTRACTOR_STREAM_READ_TIMEOUT, in seconds, raises or lowers the 30s
+   :stream_read ceiling, which a long generation can exceed between chunks
+   and which no CLI flag or DOT attribute reaches. Read per request rather
+   than at load so it follows the process environment; an unset, unparseable
+   or non-positive value leaves the default in place. A request's own
+   :adapter_timeout still wins."
+  []
+  (when-let [seconds (parse-double (str (os/getenv "ATTRACTOR_STREAM_READ_TIMEOUT")))]
+    (when (pos? seconds) {:stream_read seconds})))
+
 (defn- transport-request-options [request options]
-  (cond-> (assoc options :timeout (merge default-adapter-timeout (:adapter_timeout request)))
+  (cond-> (assoc options :timeout (merge default-adapter-timeout
+                                         (env-adapter-timeout)
+                                         (:adapter_timeout request)))
     (some? (:abort_signal request))
     (assoc :abort_signal (:abort_signal request))))
 
