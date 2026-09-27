@@ -1434,6 +1434,44 @@
             :else
             (recur)))))))
 
+(defn- history-usage
+  "Input and output tokens over the session's assistant turns so far, and how
+   many of those turns reported no usage at all."
+  [history]
+  (reduce (fn [acc turn]
+            (let [usage (:usage turn)]
+              (-> acc
+                  (update :turns inc)
+                  (update :input_tokens + (or (:input_tokens usage) 0))
+                  (update :output_tokens + (or (:output_tokens usage) 0))
+                  (update :turns_missing_usage + (if usage 0 1)))))
+          {:turns 0 :input_tokens 0 :output_tokens 0 :turns_missing_usage 0}
+          (filter #(= :assistant (:type %)) history)))
+
+(defn- record-stage-usage!
+  "Append this invocation's token usage to usage.jsonl in the stage directory.
+   A pipeline run otherwise keeps no record of what its model stages spent:
+   the provider reports usage per turn and the session holds it, but the
+   stage's prompt.md, response.md and status.json carry none of it. Measured
+   as a delta over the session, so a thread shared across stages (full
+   fidelity) is attributed turn by turn, and appended, so a stage that runs
+   more than once keeps every run."
+  [node session before]
+  (when-let [dir (get-in node [:attractor.tool-hooks/invocation :stage_dir])]
+    (let [after (history-usage (:history @session))
+          delta (merge-with - after before)
+          line (str (json/write-json (assoc delta :stage (:id node))) "\n")
+          path (str dir "/usage.jsonl")
+          prior (if (os/stat path) (io/slurp path) "")]
+      (io/spit path (str prior line)))))
+
+(defn- with-stage-usage [node session run]
+  (let [before (history-usage (:history @session))]
+    (try (run)
+         (finally
+           (try (record-stage-usage! node session before)
+                (catch Object _ nil))))))
+
 (defn make-agent-codergen-backend [& [session-opts]]
   (let [base-options (or session-opts {})]
     (fn [node prompt _ctx]
@@ -1462,7 +1500,8 @@
                 hooks (merge (:tool_hooks static-options) (:tool_hooks dynamic-options) (:attractor.tool-hooks/invocation node))
                 admission (atom (if (and cancelled? (cancelled?)) :cancelled :pending))]
             (try
-              (run-agent-turn-with-cancellation! session prompt cancelled? hooks admission)
+              (with-stage-usage node session
+                #(run-agent-turn-with-cancellation! session prompt cancelled? hooks admission))
               (catch Object e
                 ;; A newly created but never admitted session is owned only
                 ;; while its current owner remains nil. If a successor used the
@@ -1482,8 +1521,9 @@
           (let [session (make-session session-options)
                 admission (atom (if (and cancelled? (cancelled?)) :cancelled :pending))]
             (try
-              (run-agent-turn-with-cancellation! session prompt cancelled?
-                (merge (:tool_hooks static-options) (:tool_hooks dynamic-options) (:attractor.tool-hooks/invocation node)) admission)
+              (with-stage-usage node session
+                #(run-agent-turn-with-cancellation! session prompt cancelled?
+                   (merge (:tool_hooks static-options) (:tool_hooks dynamic-options) (:attractor.tool-hooks/invocation node)) admission))
               (finally
                 (when (claim-turn-close! session
                         (if (identical? admission (:current_turn_owner @session)) admission nil))

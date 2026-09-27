@@ -1,0 +1,40 @@
+;; A pipeline run records what each model stage spent, in the stage directory.
+(ns attractor.stage-usage-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [os :as os] [io :as io] [json :as json]
+            [attractor.agent :as agent] [attractor.execution :as execution]))
+
+(defn- stage-dir []
+  (str/trim (:out (os/sh "mktemp" "-d"))))
+
+(defn- backend-answering [usage]
+  (agent/make-agent-codergen-backend
+    {:project_docs []
+     :execution_env (execution/make-environment {})
+     :complete_fn (fn [_] (cond-> {:message {:role :assistant :content "done"}}
+                            usage (assoc :usage usage)))}))
+
+(defn- lines [dir]
+  (mapv json/read-json (str/split-lines (io/slurp (str dir "/usage.jsonl")))))
+
+(deftest a-stage-appends-one-usage-line-per-invocation
+  (let [dir (stage-dir)
+        backend (backend-answering {:input_tokens 10 :output_tokens 4 :total_tokens 14})
+        node {:id "draft" :attractor.tool-hooks/invocation {:stage_dir dir}}]
+    (backend node "first" nil)
+    (backend node "second" nil)
+    (is (= [{"stage" "draft" "turns" 1 "input_tokens" 10 "output_tokens" 4
+             "turns_missing_usage" 0}
+            {"stage" "draft" "turns" 1 "input_tokens" 10 "output_tokens" 4
+             "turns_missing_usage" 0}]
+           (lines dir)))))
+
+(deftest a-provider-without-usage-is-counted-rather-than-read-as-zero-cost
+  (let [dir (stage-dir)
+        node {:id "critique" :attractor.tool-hooks/invocation {:stage_dir dir}}]
+    ((backend-answering nil) node "go" nil)
+    (is (= 1 (get (first (lines dir)) "turns_missing_usage")))))
+
+(deftest a-stage-without-a-directory-records-nothing-and-still-answers
+  (is (= "done" ((backend-answering {:input_tokens 1 :output_tokens 1})
+                 {:id "draft"} "go" nil))))
