@@ -1028,18 +1028,24 @@
                         (:project_docs @session)
                         (:user_instructions config)
                         (:skills_block @session))
-                      request {:model (:model profile)
-                               :provider (:id profile)
-                               :messages
-                               (vec (cons {:role :system :content system-prompt}
-                                          (history-to-messages (:history @session))))
-                               :tools (profiles/profile-tools profile)
-                               :tool_choice {:mode "auto"}
-                               :reasoning_effort
-                               (get-in @session [:config :reasoning_effort])
-                               :provider_options (:provider_options profile)
-                               :abort_signal
-                               (get-in @session [:llm_abort_controller :signal])}
+                      ;; Without a cap here the adapter's own default applies
+                      ;; (4096 for Anthropic), which truncates any tool call
+                      ;; whose arguments carry a long file: the call arrives
+                      ;; unfinished, and the agent retries it indefinitely.
+                      output-cap (get-in @session [:config :max_output_tokens])
+                      request (cond-> {:model (:model profile)
+                                       :provider (:id profile)
+                                       :messages
+                                       (vec (cons {:role :system :content system-prompt}
+                                                  (history-to-messages (:history @session))))
+                                       :tools (profiles/profile-tools profile)
+                                       :tool_choice {:mode "auto"}
+                                       :reasoning_effort
+                                       (get-in @session [:config :reasoning_effort])
+                                       :provider_options (:provider_options profile)
+                                       :abort_signal
+                                       (get-in @session [:llm_abort_controller :signal])}
+                                output-cap (assoc :max_tokens output-cap))
                       response
                       (try
                         (refresh-context-capacity! session owner request event-fn)

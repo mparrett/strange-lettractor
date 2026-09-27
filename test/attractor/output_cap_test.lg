@@ -1,0 +1,38 @@
+;; A model stage's per-response output cap reaches the provider request.
+;; Without one the adapter's default (4096 for Anthropic) truncated a tool call
+;; carrying a whole wiki page, and the agent retried it 42 times.
+(ns attractor.output-cap-test
+  (:require [clojure.test :refer [deftest is]] [os :as os]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.cli]))
+
+(defn- captured-max-tokens [session-options]
+  (let [seen (atom :unset)
+        backend (agent/make-agent-codergen-backend
+                  (merge {:project_docs []
+                          :execution_env (execution/make-environment {})
+                          :complete_fn (fn [request]
+                                         (reset! seen (get request :max_tokens :absent))
+                                         {:message {:role :assistant :content "done"}})}
+                         session-options))]
+    (backend {:id "draft"} "go" nil)
+    @seen))
+
+(deftest a-configured-cap-is-sent-as-max-tokens
+  (is (= 32000 (captured-max-tokens {:max_output_tokens 32000}))))
+
+(deftest no-cap-leaves-the-adapter-default-in-charge
+  (is (= :absent (captured-max-tokens {}))))
+
+(deftest the-cap-comes-from-the-node-then-the-environment
+  (let [cap #'attractor.cli/stage-output-cap]
+    (try
+      (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "")
+      (is (nil? (cap {})) "unset: the adapter default applies")
+      (is (= 16000 (cap {:max_tokens "16000"})) "a node attribute")
+      (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "24000")
+      (is (= 24000 (cap {})) "the environment when the node says nothing")
+      (is (= 16000 (cap {:max_tokens "16000"})) "the node wins over the environment")
+      (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "lots")
+      (is (nil? (cap {})) "unparseable is ignored")
+      (finally (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "")))))
