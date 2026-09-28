@@ -198,6 +198,15 @@
                                (and (= :openai-chat-completions (:protocol row)) (:base_url row))))
                  (providers/effective))))
 
+(defn- stage-reasoning-effort
+  "The node's reasoning_effort attribute, else ATTRACTOR_REASONING_EFFORT, else
+   nil (the provider's default, which differs by model). Lets a deployment set
+   one effort for every stage of a graph without editing the graph."
+  [node]
+  (let [from-env (os/getenv "ATTRACTOR_REASONING_EFFORT")]
+    (or (:reasoning_effort node)
+        (when-not (str/blank? from-env) (str/trim from-env)))))
+
 (defn- stage-output-cap
   "Per-response output token cap for a model stage: the node's max_tokens
    attribute, else ATTRACTOR_MAX_OUTPUT_TOKENS, else nil (the adapter's own
@@ -230,7 +239,7 @@
                  parsed (llm/parse-model-spec
                           raw-model (or override-provider (:llm_provider node)))]
              (cond-> {:model (str (:provider parsed) "/" (:model parsed))
-                      :reasoning_effort (:reasoning_effort node)}
+                      :reasoning_effort (stage-reasoning-effort node)}
                (stage-output-cap node) (assoc :max_output_tokens (stage-output-cap node)))))})
       nil))))
 

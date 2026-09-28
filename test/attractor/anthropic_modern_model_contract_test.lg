@@ -22,7 +22,7 @@
 
 (deftest modern-models-use-adaptive-thinking-and-output-effort
   (doseq [invoke [llm/anthropic-complete llm/anthropic-stream]
-          model ["claude-fable-5-1" "claude-opus-5" "claude-sonnet-5"]]
+          model ["claude-fable-5-1" "claude-opus-5-5" "claude-opus-5" "claude-sonnet-5"]]
     (let [payload (captured-request invoke {:model model :reasoning_effort "high" :max_tokens 512})]
       (is (= {"type" "adaptive"} (get payload "thinking")))
       (is (= "high" (get-in payload ["output_config" "effort"]))))))

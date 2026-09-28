@@ -36,3 +36,13 @@
       (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "lots")
       (is (nil? (cap {})) "unparseable is ignored")
       (finally (os/setenv "ATTRACTOR_MAX_OUTPUT_TOKENS" "")))))
+
+(deftest the-effort-comes-from-the-node-then-the-environment
+  (let [effort #'attractor.cli/stage-reasoning-effort]
+    (try
+      (os/setenv "ATTRACTOR_REASONING_EFFORT" "")
+      (is (nil? (effort {})) "unset: the provider default applies")
+      (os/setenv "ATTRACTOR_REASONING_EFFORT" "low")
+      (is (= "low" (effort {})) "the environment when the node says nothing")
+      (is (= "high" (effort {:reasoning_effort "high"})) "the node wins")
+      (finally (os/setenv "ATTRACTOR_REASONING_EFFORT" "")))))
