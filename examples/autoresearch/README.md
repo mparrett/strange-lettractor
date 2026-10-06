@@ -51,8 +51,8 @@ The demos stop after `MAX_ITERATIONS=3`.
 1. Copy `ar.sh`, `autoresearch.dot`, `program.md` into `<repo>/autoresearch/`.
 2. Write `<repo>/research.env` from `research.env.sample`: `EDITABLE`, `RUN_CMD`,
    `METRIC_REGEX`, `DIRECTION` (`min` or `max`, anything else is refused, and
-   `setup` refuses a `GOAL` that says maximize under `min` or the reverse), a
-   fresh `TAG`.
+   `setup` refuses a `GOAL` that says maximize but not minimize under `min`, or
+   the reverse), a fresh `TAG`.
 3. Make the experiment print its metric on one line and **exit non-zero on a
    wrong result**, so a fast wrong answer is a crash, not a win.
 4. Optionally add `notes.md`: what the researcher needs to know about the

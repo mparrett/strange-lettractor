@@ -36,9 +36,12 @@ discard_work() { git reset -q --hard "$(cat "$STATE/base")"; git clean -qfd; }
 case "${1:-}" in
 setup)
   git rev-parse --git-dir >/dev/null
-  # The researcher reads GOAL; decide reads DIRECTION. Catch the two disagreeing.
-  case "$DIRECTION:$(printf '%s' "${GOAL:-}" | tr '[:upper:]' '[:lower:]')" in
-    min:*maximi[sz]e*|max:*minimi[sz]e*)
+  # The researcher reads GOAL; decide reads DIRECTION. Catch the two disagreeing,
+  # but let a compound goal ("minimize loss, maximize accuracy") through.
+  case "$DIRECTION" in min) want=minimi opposite=maximi ;; *) want=maximi opposite=minimi ;; esac
+  case "$(printf '%s' "${GOAL:-}" | tr '[:upper:]' '[:lower:]')" in
+    *"$want"[sz]*) ;;
+    *"$opposite"[sz]*)
       echo "GOAL says \"$GOAL\" but DIRECTION=$DIRECTION: fix one of them" >&2; exit 1 ;;
   esac
   branch="autoresearch/$TAG"
