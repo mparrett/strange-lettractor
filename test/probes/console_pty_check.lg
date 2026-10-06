@@ -3,7 +3,7 @@
    pseudo-terminal and relays a paced stdin pipe, so the built CLI runs under a
    real tty with the mock model. Run from the console worktree after lgx build."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
-            [os :as os] [io :as io]))
+            [os :as os] [io :as io] [harness.tests :as tests]))
 
 (defn- temp-file [] (str/trim (:out (os/sh "/usr/bin/mktemp"))))
 (defn- drive [typescript args script]
@@ -37,10 +37,5 @@
     (os/sh "/bin/rm" "-f" "--" typescript)))
 
 (defn -main [& _]
-  (let [summary (atom nil)
-        output (with-out-str (reset! summary (clojure.test/run-tests)))
-        ok (clojure.test/successful? @summary)]
-    (prn @summary)
-    (when-not ok (println output))
-    (os/exit (if ok 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))

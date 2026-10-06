@@ -2,15 +2,10 @@
 ;; Run with argument "run"; no test execution during the bundle build.
 (ns main
   (:require [attractor.codex.framing]
-            [attractor.codex-framing-test]))
+            [attractor.codex-framing-test]
+            [harness.tests :as tests]))
 
 (defn -main [& _]
-  (let [summary (atom nil)
-        output (with-out-str
-                 (reset! summary (clojure.test/run-tests 'attractor.codex-framing-test)))
-        ok (clojure.test/successful? @summary)]
-    (prn @summary)
-    (when-not ok (println output))
-    (os/exit (if ok 0 1))))
+  (tests/run-and-exit! 'attractor.codex-framing-test))
 
 (when *command-line-args* (apply -main *command-line-args*))

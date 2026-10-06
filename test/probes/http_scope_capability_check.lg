@@ -1,14 +1,10 @@
-(ns main (:require [clojure.test :refer [deftest is]] [http :as http] [os :as os]))
+(ns main (:require [clojure.test :refer [deftest is]] [http :as http]
+                    [harness.tests :as tests]))
 
 (deftest http-client-vars-advertise-native-scope-cancellation
   (doseq [v [#'http/get #'http/post #'http/request]]
     (is (true? (:scope-cancellation (meta v))))))
 
 (defn -main [& _]
-  (let [summary (atom nil)
-        output (with-out-str (reset! summary (clojure.test/run-tests)))
-        ok (clojure.test/successful? @summary)]
-    (prn @summary)
-    (when-not ok (println output))
-    (os/exit (if ok 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))
