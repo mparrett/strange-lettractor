@@ -1,8 +1,6 @@
 (ns probes.session-error-http-bounded
-  (:require [attractor.execution :as execution] [clojure.string :as str]
+  (:require [attractor.execution :as execution] [attractor.http-fixture :refer [quote-shell]]
             [harness.runtime :as runtime] [os :as os]))
-
-(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
 
 (defn command [args]
   (when (> (count args) 1) (throw (ex-info "Expected at most one port argument" {})))

@@ -1,8 +1,8 @@
 (ns session-error-http-check
   (:require [attractor.agent :as agent] [attractor.llm :as llm]
             [attractor.profiles :as profiles] [attractor.execution :as execution]
-            [harness.runtime :as runtime] [http :as http] [os :as os]
-            [clojure.string :as str]))
+            [attractor.http-fixture :refer [quote-shell]]
+            [harness.runtime :as runtime] [http :as http] [os :as os]))
 
 (defn caught [f] (try (f) nil (catch Object e (ex-data e))))
 (defn types [session] (mapv :type (agent/session-events session)))
@@ -66,7 +66,6 @@
         (zero? remaining) (throw (ex-info "Fixture readiness deadline exceeded" {}))
         :else (do (sleep 20) (recur (dec remaining)))))))
 
-(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
 (defn run-checks [port]
   (let [token (str "session-" (rand-int 1000000000))
         base (str "http://127.0.0.1:" port)
